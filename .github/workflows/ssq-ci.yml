@@ -1,0 +1,30 @@
+name: ssq-ci
+on:
+  workflow_dispatch:
+  push:
+    branches:
+    - ssq/v5
+
+permissions: {}
+
+jobs:
+  test:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+    - name: Install Go
+      uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+      with:
+        go-version: 'stable'
+
+    - name: Set Git config
+      run: |
+        git config --global user.email "gha@example.com"
+        git config --global user.name "GitHub Actions"
+
+    - name: Test
+      run: go test ./...
