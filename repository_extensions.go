@@ -40,16 +40,29 @@ var (
 		// noop-v1 does not change git’s behavior at all.
 		// It is useful only for testing format-1 compatibility.
 		"noop-v1": {},
+
+		// worktreeconfig enables per-worktree config.worktree files. go-git
+		// does not read those files, which is safe for the ref, remote and
+		// object access it performs.
+		"worktreeconfig": {},
+
+		// partialclone and preciousobjects are accepted so repos using them
+		// open. go-git cannot lazy-fetch promisor objects, so reads of omitted
+		// objects fail with "object not found"; it never garbage-collects, so
+		// preciousobjects is respected trivially.
+		"partialclone":    {},
+		"preciousobjects": {},
 	}
 
 	// Some Git extensions were supported upstream before the introduction
 	// of repositoryformatversion. These are the only extensions that can be
 	// enabled while core.repositoryformatversion is unset or set to 0.
+	// Keys must be lowercase to match extensions(), which lowercases names.
 	extensionsValidForV0 = map[string]struct{}{
 		"noop":            {},
-		"partialClone":    {},
-		"preciousObjects": {},
-		"worktreeConfig":  {},
+		"partialclone":    {},
+		"preciousobjects": {},
+		"worktreeconfig":  {},
 	}
 )
 

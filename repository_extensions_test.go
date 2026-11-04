@@ -58,6 +58,37 @@ func TestVerifyExtensions(t *testing.T) {
 			},
 		},
 		{
+			name: "repositoryformatversion=0: allows worktreeConfig",
+			setup: func(t *testing.T, cfg *config.Config) {
+				cfg.Core.RepositoryFormatVersion = formatcfg.Version_0
+				cfg.Raw.Section("extensions").SetOption("worktreeConfig", "true")
+			},
+		},
+		{
+			name: "repositoryformatversion=1: allows worktreeConfig",
+			setup: func(t *testing.T, cfg *config.Config) {
+				cfg.Core.RepositoryFormatVersion = formatcfg.Version_1
+				cfg.Raw.Section("extensions").SetOption("worktreeConfig", "true")
+			},
+		},
+		{
+			name: "repositoryformatversion=0: allows partialClone and preciousObjects",
+			setup: func(t *testing.T, cfg *config.Config) {
+				cfg.Core.RepositoryFormatVersion = formatcfg.Version_0
+				cfg.Raw.Section("extensions").SetOption("partialClone", "origin")
+				cfg.Raw.Section("extensions").SetOption("preciousObjects", "true")
+			},
+		},
+		{
+			name: "repositoryformatversion=0: worktreeConfig does not mask an invalid extension",
+			setup: func(t *testing.T, cfg *config.Config) {
+				cfg.Core.RepositoryFormatVersion = formatcfg.Version_0
+				cfg.Raw.Section("extensions").SetOption("worktreeConfig", "true")
+				cfg.Raw.Section("extensions").SetOption("objectformat", "sha1")
+			},
+			wantErr: "repositoryformatversion does not support extension: objectformat",
+		},
+		{
 			name: "repositoryformatversion=1: rejects objectformat=sha1", // not supported in go-git/v5
 			setup: func(t *testing.T, cfg *config.Config) {
 				cfg.Core.RepositoryFormatVersion = formatcfg.Version_1
@@ -94,4 +125,22 @@ func TestVerifyExtensions(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestOpenRepo_should_Succeed_When_V0RepoHasWorktreeConfigExtension(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	r, err := PlainInit(dir, false)
+	require.NoError(t, err)
+
+	cfg, err := r.Config()
+	require.NoError(t, err)
+	cfg.Core.RepositoryFormatVersion = formatcfg.Version_0
+	cfg.Raw.Section("extensions").SetOption("worktreeConfig", "true")
+	require.NoError(t, r.SetConfig(cfg))
+
+	opened, err := PlainOpenWithOptions(dir, &PlainOpenOptions{DetectDotGit: true, EnableDotGitCommonDir: true})
+	require.NoError(t, err)
+	assert.NotNil(t, opened)
 }
