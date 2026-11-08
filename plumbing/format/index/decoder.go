@@ -52,10 +52,10 @@ type Decoder struct {
 
 	extReader *bufio.Reader
 
-	slab    []Entry                 // unused tail of the current Entry allocation chunk
-	nameBuf []byte                  // scratch for V2/V3 names, so each name costs one string allocation
-	hdr     [entryHeaderLength]byte // fixed entry header; a field because a local would escape through io.Reader
-	pad     [8]byte                 // V2/V3 entry padding (at most 8 bytes)
+	slab    []Entry       // unused tail of the current Entry allocation chunk
+	nameBuf []byte        // scratch for V2/V3 names, so each name costs one string allocation
+	hdr     [42 + 32]byte // 40 fixed bytes + hash (up to SHA-256) + 2 flag bytes; a field because a local would escape through io.Reader
+	pad     [8]byte       // V2/V3 entry padding (at most 8 bytes)
 }
 
 // NewDecoder returns a new decoder that reads from r.
@@ -125,7 +125,7 @@ func (d *Decoder) readEntry(idx *Index) (*Entry, error) {
 	// One read of the fixed-size header. encoding/binary.Read allocated per
 	// field (about 27 allocations per entry); decoding from a stack buffer
 	// allocates none.
-	hdr := d.hdr[:]
+	hdr := d.hdr[:42+len(e.Hash)]
 	if _, err := io.ReadFull(d.r, hdr); err != nil {
 		return nil, err
 	}
