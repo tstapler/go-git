@@ -1055,6 +1055,10 @@ func (s *ObjectStorage) DeleteOldObjectPackAndIndex(h plumbing.Hash, t time.Time
 	if s.pool != nil {
 		// An idle handle would block deleting the pack on Windows and pin its space elsewhere.
 		_ = s.pool.closeAll()
+		_ = s.files.closeAll()
+	}
+	if s.maps != nil {
+		s.maps.drop()
 	}
 	return s.dir.DeleteOldObjectPackAndIndex(h, t)
 }
