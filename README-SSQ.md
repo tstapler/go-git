@@ -60,7 +60,7 @@ This is a public fork of [go-git/go-git](https://github.com/go-git/go-git) used 
   packed-object read. Handles are borrowed exclusively (no shared seek state between concurrent reads), the least
   recently returned pack is evicted when full, `Close` releases them, and `ObjectStorage.OpenPackHandles` /
   `Options.OnOpenPackHandles` expose the open count. A storage dropped without `Close` releases them when the
-  garbage collector finalizes the files. On Windows an idle handle blocks deleting that pack file until `Close`.
+  garbage collector finalizes the files. On Windows the pool is off unless `MaxIdlePackHandles` is set, because an idle handle blocks deleting that pack file (repack, prune) until `Close`.
   Measured on a 13k-file repository with 45 packs, default open: tree diff 184 to about 15-30 ms, log walk
   172 to about 21-30 ms.
 - **gitignore**: `ReadPatterns` no longer descends into a directory ignored by an ancestor's pattern.
