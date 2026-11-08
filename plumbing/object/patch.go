@@ -1,6 +1,7 @@
 package object
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/filemode"
 	fdiff "github.com/go-git/go-git/v5/plumbing/format/diff"
 	"github.com/go-git/go-git/v5/utils/diff"
+	"github.com/go-git/go-git/v5/utils/ioutil"
 
 	dmp "github.com/sergi/go-diff/diffmatchpatch"
 )
@@ -96,19 +98,35 @@ func filePatchWithContext(ctx context.Context, c *Change) (fdiff.FilePatch, erro
 
 }
 
+// fileContent reads the file once: the first sniffLen bytes decide whether it is binary (git's
+// buffer_is_binary, the same rule as File.IsBinary) and the same reader supplies the content. Reading
+// twice, as IsBinary followed by Contents does, doubles the inflate and open cost of packed objects.
 func fileContent(f *File) (content string, isBinary bool, err error) {
 	if f == nil {
 		return
 	}
 
-	isBinary, err = f.IsBinary()
-	if err != nil || isBinary {
-		return
+	r, err := f.Reader()
+	if err != nil {
+		return "", false, err
+	}
+	defer ioutil.CheckClose(r, &err)
+
+	br := bufio.NewReaderSize(r, sniffLen+192)
+	head, err := br.Peek(sniffLen)
+	if err != nil && err != io.EOF && err != bufio.ErrBufferFull {
+		return "", false, err
+	}
+	if bytes.IndexByte(head, 0) >= 0 {
+		return "", true, nil
 	}
 
-	content, err = f.Contents()
+	buf := bytes.NewBuffer(make([]byte, 0, f.Size+1))
+	if _, err = io.Copy(buf, br); err != nil {
+		return "", false, err
+	}
 
-	return
+	return buf.String(), false, nil
 }
 
 // Patch is an implementation of fdiff.Patch interface

@@ -400,6 +400,16 @@ func (s *ObjectStorage) DeltaObject(t plumbing.ObjectType,
 }
 
 func (s *ObjectStorage) getFromUnpacked(h plumbing.Hash) (obj plumbing.EncodedObject, err error) {
+	// A cache hit still has to prove the object exists in THIS repository (the cache may be shared
+	// between repositories), but a stat is cheaper than the open, header read and close below.
+	if s.objectCache != nil {
+		if cacheObj, found := s.objectCache.Get(h); found {
+			if _, statErr := s.dir.ObjectStat(h); statErr == nil {
+				return cacheObj, nil
+			}
+		}
+	}
+
 	f, err := s.dir.Object(h)
 	if err != nil {
 		if os.IsNotExist(err) {

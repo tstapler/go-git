@@ -1,10 +1,16 @@
 package object
 
 import (
+	"bufio"
+	"bytes"
 	"errors"
 	"io"
+	"runtime"
+	"slices"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/filemode"
@@ -74,25 +80,24 @@ func (d *renameDetector) detectExactRenames() {
 	sortChangesByName(d.added)
 	sortChangesByName(d.deleted)
 
-	srcsByHash := groupChangesByHash(d.deleted)
+	buckets := make(map[exactKey]*exactBucket)
+	for _, src := range d.deleted {
+		key := exactKey{changeHash(src), exactKind(changeMode(src))}
+		b := buckets[key]
+		if b == nil {
+			b = &exactBucket{byBase: make(map[string]*[]int)}
+			buckets[key] = b
+		}
+		b.add(src)
+	}
+
 	used := make(map[*Change]struct{})
 	var addedLeft []*Change
-
 	for _, add := range d.added {
+		b := buckets[exactKey{changeHash(add), exactKind(changeMode(add))}]
 		var best *Change
-		bestScore := 0
-		for _, src := range srcsByHash[changeHash(add)] {
-			if _, ok := used[src]; ok || !sameMode(src, add) {
-				continue
-			}
-			// git: score = !rename_used (always 1 here) + basename_same.
-			score := 1 + basenameSame(src, add)
-			if score > bestScore {
-				best, bestScore = src, score
-				if score == 2 {
-					break
-				}
-			}
+		if b != nil {
+			best = b.take(baseName(changeName(add)))
 		}
 		if best == nil {
 			addedLeft = append(addedLeft, add)
@@ -109,6 +114,74 @@ func (d *renameDetector) detectExactRenames() {
 		}
 	}
 	d.added, d.deleted = addedLeft, deletedLeft
+}
+
+// exactKey groups files that may be paired as exact renames: identical content and a
+// compatible file type (see sameMode).
+type exactKey struct {
+	hash plumbing.Hash
+	kind filemode.FileMode
+}
+
+// exactKind maps regular and executable files to one kind, as git lets them pair.
+func exactKind(m filemode.FileMode) filemode.FileMode {
+	if isRegularFile(m) {
+		return filemode.Regular
+	}
+	return m
+}
+
+// exactBucket holds the unused sources of one exactKey in path order, with cursors so a large
+// group of identical files costs O(1) per destination instead of a rescan: take returns the first
+// unused source with the destination's basename, else the first unused source, which is what
+// git's find_identical_files picks (its score 2 breaks at the first same-basename candidate).
+type exactBucket struct {
+	srcs   []*Change
+	used   []bool
+	next   int
+	byBase map[string]*[]int // basename -> indices into srcs, in path order
+	cursor map[string]int
+}
+
+func (b *exactBucket) add(src *Change) {
+	i := len(b.srcs)
+	b.srcs = append(b.srcs, src)
+	b.used = append(b.used, false)
+	base := baseName(changeName(src))
+	list := b.byBase[base]
+	if list == nil {
+		list = new([]int)
+		b.byBase[base] = list
+	}
+	*list = append(*list, i)
+}
+
+func (b *exactBucket) take(base string) *Change {
+	if list := b.byBase[base]; list != nil {
+		if b.cursor == nil {
+			b.cursor = make(map[string]int)
+		}
+		c := b.cursor[base]
+		for c < len(*list) && b.used[(*list)[c]] {
+			c++
+		}
+		b.cursor[base] = c
+		if c < len(*list) {
+			return b.claim((*list)[c])
+		}
+	}
+	for b.next < len(b.srcs) && b.used[b.next] {
+		b.next++
+	}
+	if b.next < len(b.srcs) {
+		return b.claim(b.next)
+	}
+	return nil
+}
+
+func (b *exactBucket) claim(i int) *Change {
+	b.used[i] = true
+	return b.srcs[i]
 }
 
 func sortChangesByName(changes []*Change) {
@@ -237,36 +310,67 @@ func pairSimilarity(src, dst *Change, renameScore int) (score int, ok bool, err 
 // (NUM_CANDIDATE_PER_DST) is filled by record_if_better over every source, with sources that
 // cannot match (symlinks, too different in size) counting as score 0 so they still occupy
 // slots; the destination-major array is then stable-sorted by score_compare and paired in
-// order. Each file's similarity index is built once: a destination's for the duration of its
-// row, a source's through a bounded cache.
+// order. Each file's similarity index is built once (sources up front, within a memory
+// budget; destinations a batch at a time) and the O(sources x destinations) scoring, which
+// only reads those indexes, runs on GOMAXPROCS workers. Rows are independent and written to
+// fixed positions, so the result does not depend on scheduling.
 func (d *renameDetector) detectContentRenames() error {
 	if tooManyRenameCandidates(len(d.added), len(d.deleted), d.renameLimit) {
 		return nil
 	}
 	srcs, dsts := d.deleted, d.added
-	budget := d.indexCacheBudget
-	if budget == 0 {
-		budget = maxCachedIndexBytes
-	}
-	srcIndexes := newSimilarityIndexCache(max(budget, 0))
-	srcFiles := make([]*File, len(srcs))
 	minScore := d.renameScore * 100
 
-	mx := make([]renameCandidate, 0, len(dsts)*numCandidatesPerDst)
-	for dstIdx, dst := range dsts {
-		slots := [numCandidatesPerDst]renameCandidate{}
-		for k := range slots {
-			slots[k].dst = -1
+	srcInfos, err := d.prepareSources(srcs, dsts)
+	if err != nil {
+		return err
+	}
+	parallel := true
+	for _, s := range srcInfos {
+		if s.needed && !s.tooBig && s.index == nil {
+			parallel = false // over the cache budget: rebuilt per use, which touches storage
 		}
-		row := dstRow{dst: dst}
-		for srcIdx, src := range srcs {
-			score, err := row.score(srcIdx, src, srcFiles, srcIndexes, d.renameScore)
-			if err != nil {
+	}
+	workers := 1
+	if parallel {
+		workers = min(runtime.GOMAXPROCS(0), len(dsts))
+	}
+
+	mx := make([]renameCandidate, len(dsts)*numCandidatesPerDst)
+	batch := max(workers*4, 1)
+	for start := 0; start < len(dsts); start += batch {
+		end := min(start+batch, len(dsts))
+		rows := make([]dstRow, end-start)
+		for i := range rows {
+			if err := rows[i].load(dsts[start+i], srcInfos, d.renameScore); err != nil {
 				return err
 			}
-			recordIfBetter(&slots, renameCandidate{dst: dstIdx, src: srcIdx, score: score, name: basenameSame(src, dst)})
 		}
-		mx = append(mx, slots[:]...)
+		var next atomic.Int64
+		var wg sync.WaitGroup
+		var rebuildErr error
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					i := int(next.Add(1)) - 1
+					if i >= len(rows) {
+						return
+					}
+					slots, err := d.scoreRow(&rows[i], start+i, srcs, srcInfos, minScore)
+					if err != nil {
+						rebuildErr = err // only reachable when workers == 1
+						return
+					}
+					copy(mx[(start+i)*numCandidatesPerDst:], slots[:])
+				}
+			}()
+		}
+		wg.Wait()
+		if rebuildErr != nil {
+			return rebuildErr
+		}
 	}
 	sort.SliceStable(mx, func(i, j int) bool { return scoreCompare(mx[i], mx[j]) < 0 })
 
@@ -340,61 +444,142 @@ func recordIfBetter(slots *[numCandidatesPerDst]renameCandidate, o renameCandida
 	}
 }
 
-// dstRow scores one destination against many sources, building the destination's similarity
-// index at most once.
-type dstRow struct {
-	dst     *Change
+// contentSource is a deleted file prepared for scoring.
+type contentSource struct {
 	file    *File
-	index   *similarityIndex
+	index   *similarityIndex // nil when not needed, too big, or over the cache budget
+	size    int64
+	regular bool
+	needed  bool // some destination passes the size filter against it
 	tooBig  bool
-	indexed bool
 }
 
-// score returns 0 when the pair cannot be a content rename (not two regular files, sizes too
-// different, or a file too large to index), like git's estimate_similarity returning 0.
-func (r *dstRow) score(srcIdx int, src *Change, srcFiles []*File, srcIndexes *similarityIndexCache, renameScore int) (int, error) {
-	if !isRegularFile(changeMode(src)) || !isRegularFile(changeMode(r.dst)) {
-		return 0, nil
-	}
-	var err error
-	from := srcFiles[srcIdx]
-	if from == nil {
-		if from, _, err = src.Files(); err != nil {
-			return 0, err
-		}
-		srcFiles[srcIdx] = from
-	}
-	if r.file == nil {
-		if _, r.file, err = r.dst.Files(); err != nil {
-			return 0, err
-		}
-	}
-	srcSize, dstSize := from.Size+1, r.file.Size+1
+// dstRow is an added file prepared for scoring against every source.
+type dstRow struct {
+	index   *similarityIndex
+	size    int64
+	regular bool
+	tooBig  bool
+}
+
+// sizeCanMatch is git's estimate_similarity size bound: files whose sizes differ by more than
+// the minimum score allows cannot reach it.
+func sizeCanMatch(srcSize, dstSize int64, renameScore int) bool {
+	srcSize, dstSize = srcSize+1, dstSize+1
 	lo, hi := srcSize, dstSize
 	if dstSize < srcSize {
 		lo, hi = dstSize, srcSize
 	}
-	if int(lo*100/hi) < renameScore {
-		return 0, nil
+	return int(lo*100/hi) >= renameScore
+}
+
+// prepareSources opens each regular deleted file and builds the similarity index of those that
+// some destination could match, caching indexes up to the byte budget.
+func (d *renameDetector) prepareSources(srcs, dsts []*Change) ([]contentSource, error) {
+	budget := d.indexCacheBudget
+	if budget == 0 {
+		budget = maxCachedIndexBytes
 	}
-	si, err := srcIndexes.get(srcIdx, func() (*File, error) { return from, nil })
-	if err == errIndexFull {
-		return 0, nil
-	} else if err != nil {
-		return 0, err
+	cache := newSimilarityIndexCache(max(budget, 0))
+
+	dstSizes := make([]int64, len(dsts))
+	dstRegular := make([]bool, len(dsts))
+	for i, dst := range dsts {
+		if !isRegularFile(changeMode(dst)) {
+			continue
+		}
+		_, f, err := dst.Files()
+		if err != nil {
+			return nil, err
+		}
+		dstSizes[i], dstRegular[i] = f.Size, true
 	}
-	if !r.indexed {
-		r.indexed = true
-		if r.index, err = fileSimilarityIndex(r.file); err == errIndexFull {
-			r.tooBig = true
+
+	infos := make([]contentSource, len(srcs))
+	for i, src := range srcs {
+		if !isRegularFile(changeMode(src)) {
+			continue
+		}
+		f, _, err := src.Files()
+		if err != nil {
+			return nil, err
+		}
+		infos[i] = contentSource{file: f, size: f.Size, regular: true}
+		for j := range dsts {
+			if dstRegular[j] && sizeCanMatch(f.Size, dstSizes[j], d.renameScore) {
+				infos[i].needed = true
+				break
+			}
+		}
+		if !infos[i].needed {
+			continue
+		}
+		idx, err := cache.get(i, func() (*File, error) { return f, nil })
+		if err == errIndexFull {
+			infos[i].tooBig = true
+			continue
 		} else if err != nil {
-			return 0, err
+			return nil, err
+		}
+		if _, cached := cache.indexes[i]; cached {
+			infos[i].index = idx
 		}
 	}
-	if r.tooBig {
-		return 0, nil
+	return infos, nil
+}
+
+// load prepares dst for scoring, building its similarity index when some source could match.
+func (r *dstRow) load(dst *Change, srcs []contentSource, renameScore int) error {
+	if !isRegularFile(changeMode(dst)) {
+		return nil
 	}
-	return si.score(r.index, 10000), nil
+	_, f, err := dst.Files()
+	if err != nil {
+		return err
+	}
+	r.regular, r.size = true, f.Size
+	for _, s := range srcs {
+		if s.needed && !s.tooBig && sizeCanMatch(s.size, f.Size, renameScore) {
+			if r.index, err = fileSimilarityIndex(f); err == errIndexFull {
+				r.tooBig, r.index = true, nil
+			} else if err != nil {
+				return err
+			}
+			return nil
+		}
+	}
+	return nil
+}
+
+// scoreRow fills the destination's candidate slots over all sources. It scores 0 for pairs that
+// cannot be a content rename, like git's estimate_similarity returning 0, and also, as a pure
+// shortcut, for pairs whose best possible score (the smaller hashed byte count over the larger)
+// is already below the minimum: such a pair can never be paired, whatever its exact score.
+func (d *renameDetector) scoreRow(row *dstRow, dstIdx int, srcs []*Change, infos []contentSource, minScore int) ([numCandidatesPerDst]renameCandidate, error) {
+	slots := [numCandidatesPerDst]renameCandidate{}
+	for k := range slots {
+		slots[k].dst = -1
+	}
+	dst := d.added[dstIdx]
+	for srcIdx, s := range infos {
+		score := 0
+		if s.regular && row.regular && !s.tooBig && !row.tooBig && row.index != nil && sizeCanMatch(s.size, row.size, d.renameScore) {
+			idx := s.index
+			if idx == nil {
+				var err error
+				if idx, err = fileSimilarityIndex(s.file); err == errIndexFull {
+					idx = nil
+				} else if err != nil {
+					return slots, err
+				}
+			}
+			if idx != nil {
+				score = idx.scoreAtLeast(row.index, 10000, minScore)
+			}
+		}
+		recordIfBetter(&slots, renameCandidate{dst: dstIdx, src: srcIdx, score: score, name: basenameSame(srcs[srcIdx], dst)})
+	}
+	return slots, nil
 }
 
 // tooManyRenameCandidates reports whether inexact (content-similarity) rename
@@ -473,15 +658,6 @@ func sameMode(a, b *Change) bool {
 // isRegularFile is git's S_ISREG: regular and executable files, not symlinks or submodules.
 func isRegularFile(m filemode.FileMode) bool {
 	return m == filemode.Regular || m == filemode.Executable || m == filemode.Deprecated
-}
-
-func groupChangesByHash(changes []*Change) map[plumbing.Hash][]*Change {
-	var result = make(map[plumbing.Hash][]*Change)
-	for _, c := range changes {
-		hash := changeHash(c)
-		result[hash] = append(result[hash], c)
-	}
-	return result
 }
 
 func max(a, b int) int {
@@ -567,9 +743,23 @@ func fileSimilarityIndex(f *File) (*similarityIndex, error) {
 		return nil, err
 	}
 
-	sort.Stable(keyCountPairs(idx.hashes))
+	idx.compact()
 
 	return idx, nil
+}
+
+// compact drops the empty slots of the hash table and sorts the entries by key. Empty slots
+// (key 0, count 0) never contribute to a score, so the result is unchanged, but score() now
+// merges only the real entries (a small file has about a dozen, in a 256-slot table).
+func (i *similarityIndex) compact() {
+	entries := make([]keyCountPair, 0, i.numHashes)
+	for _, p := range i.hashes {
+		if p != 0 {
+			entries = append(entries, p)
+		}
+	}
+	slices.Sort(entries)
+	i.hashes = entries
 }
 
 func newSimilarityIndex() *similarityIndex {
@@ -580,21 +770,27 @@ func newSimilarityIndex() *similarityIndex {
 	}
 }
 
-func (i *similarityIndex) hash(f *File) error {
-	isBin, err := f.IsBinary()
-	if err != nil {
-		return err
-	}
-
+// hash reads the file once: the first sniffLen bytes decide whether it is binary
+// (git's buffer_is_binary) before the same reader feeds the hashing.
+func (i *similarityIndex) hash(f *File) (err error) {
 	r, err := f.Reader()
 	if err != nil {
 		return err
 	}
-
 	defer ioutil.CheckClose(r, &err)
 
-	return i.hashContent(r, f.Size, isBin)
+	br := bufio.NewReaderSize(r, sniffLen+192)
+	head, err := br.Peek(sniffLen)
+	if err != nil && err != io.EOF && err != bufio.ErrBufferFull {
+		return err
+	}
+	isBin := bytes.IndexByte(head, 0) >= 0
+
+	return i.hashContent(br, f.Size, isBin)
 }
+
+// sniffLen is how many leading bytes git inspects when deciding a file is binary.
+const sniffLen = 8000
 
 func (i *similarityIndex) hashContent(r io.Reader, size int64, isBin bool) error {
 	var buf = make([]byte, 4096)
@@ -670,6 +866,19 @@ func (i *similarityIndex) score(other *similarityIndex, maxScore int) int {
 	}
 
 	return int(i.common(other) * uint64(maxScore) / maxHashed)
+}
+
+// scoreAtLeast is score, except it returns 0 without merging when the smaller hashed byte count
+// over the larger already bounds the score below floor (a score below floor is never used).
+func (i *similarityIndex) scoreAtLeast(other *similarityIndex, maxScore, floor int) int {
+	lo, hi := i.hashed, other.hashed
+	if hi < lo {
+		lo, hi = hi, lo
+	}
+	if hi != 0 && int(lo*uint64(maxScore)/hi) < floor {
+		return 0
+	}
+	return i.score(other, maxScore)
 }
 
 func (i *similarityIndex) common(dst *similarityIndex) uint64 {
@@ -815,9 +1024,3 @@ func (i *similarityIndex) grow() error {
 
 	return nil
 }
-
-type keyCountPairs []keyCountPair
-
-func (p keyCountPairs) Len() int           { return len(p) }
-func (p keyCountPairs) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
-func (p keyCountPairs) Less(i, j int) bool { return p[i] < p[j] }

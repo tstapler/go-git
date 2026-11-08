@@ -48,6 +48,13 @@ This is a public fork of [go-git/go-git](https://github.com/go-git/go-git) used 
   oracle (git 2.31 or newer, with `STABLE_QSORT`, is).
 - **Performance note**: the basename pre-pass builds both indexes for each candidate pair and does not use
   the source-index cache, so a failed pre-pass pair costs up to twice the indexing of the cached path.
+- **Performance** (stacked change; see `bench/README.md` for the cross-library harness and numbers): rename
+  scoring runs on GOMAXPROCS workers over compacted similarity indexes (empty hash slots dropped, so a merge
+  walks about a dozen entries instead of 256) with a hashed-size bound that skips pairs which cannot reach the
+  minimum score; each blob is read once for hashing and once for diffing (`fileContent` no longer inflates it
+  twice); duplicate-content exact-rename groups cost O(1) per destination; and a loose-object cache hit costs a
+  `stat` instead of an open and close (the stat keeps shared object caches correct across repositories).
+  Results are unchanged (same oracle tests).
 - **Module line is unchanged** (`module github.com/go-git/go-git/v5`). The app consumes the fork with a
   `replace` directive, so import paths stay `github.com/go-git/go-git/v5`.
 - **Tags**: `vX.Y.Z-ssq.N` (never branch pseudo-versions). `v5.19.2-ssq.0` is the unmodified upstream
