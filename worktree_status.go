@@ -142,7 +142,18 @@ func (w *Worktree) diffStagingWithWorktree(reverse, excludeIgnoredChanges bool) 
 		return nil, err
 	}
 
-	to := filesystem.NewRootNodeWithOptions(w.Filesystem, submodules, filesystem.Options{Index: idx})
+	var matcher gitignore.Matcher
+	fsOptions := filesystem.Options{Index: idx}
+	if excludeIgnoredChanges {
+		matcher = w.ignoreMatcher()
+		if matcher != nil {
+			// Do not walk untracked ignored directories at all; their changes would be dropped below.
+			fsOptions.IgnoreUntracked = func(p string, isDir bool) bool {
+				return matcher.Match(strings.Split(p, "/"), isDir)
+			}
+		}
+	}
+	to := filesystem.NewRootNodeWithOptions(w.Filesystem, submodules, fsOptions)
 
 	var c merkletrie.Changes
 	if reverse {
@@ -156,24 +167,32 @@ func (w *Worktree) diffStagingWithWorktree(reverse, excludeIgnoredChanges bool) 
 	}
 
 	if excludeIgnoredChanges {
-		return w.excludeIgnoredChanges(c), nil
+		return w.excludeIgnoredChanges(c, matcher), nil
 	}
 	return c, nil
 }
 
-func (w *Worktree) excludeIgnoredChanges(changes merkletrie.Changes) merkletrie.Changes {
+// ignoreMatcher returns a matcher over the worktree's gitignore patterns and Excludes, or nil when
+// there are none (or they cannot be read).
+func (w *Worktree) ignoreMatcher() gitignore.Matcher {
 	patterns, err := gitignore.ReadPatterns(w.Filesystem, nil)
 	if err != nil {
-		return changes
+		return nil
 	}
 
 	patterns = append(patterns, w.Excludes...)
 
 	if len(patterns) == 0 {
-		return changes
+		return nil
 	}
 
-	m := gitignore.NewMatcher(patterns)
+	return gitignore.NewMatcher(patterns)
+}
+
+func (w *Worktree) excludeIgnoredChanges(changes merkletrie.Changes, m gitignore.Matcher) merkletrie.Changes {
+	if m == nil {
+		return changes
+	}
 
 	var res merkletrie.Changes
 	for _, ch := range changes {

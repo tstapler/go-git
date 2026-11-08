@@ -64,6 +64,18 @@ This is a public fork of [go-git/go-git](https://github.com/go-git/go-git) used 
   Measured on a 13k-file repository with 45 packs, default open: tree diff 184 to about 15-30 ms, log walk
   172 to about 21-30 ms.
 - **gitignore**: `ReadPatterns` no longer descends into a directory ignored by an ancestor's pattern.
+- **Dependency**: `github.com/klauspost/compress` v1.20.3 (pure Go, no cgo), pinned in `go.mod`, supplies the zlib
+  reader used for every packed and loose object read (`utils/sync/zlib.go`; writers stay on `compress/zlib`).
+  Measured inflate throughput in isolation: +35% on text-like data, +18% on highly repetitive data; end to end on
+  a 13k-file repository about 5-8% less CPU for patch statistics and no change for reading blobs.
+- **Lazy pack reads**: `packfile.FSObject` (objects over 16 KiB) borrows pack handles from a `HandleSource` set by the
+  storage's handle pool instead of reopening the pack for each `Reader()` call; about 10% less CPU reading all blobs.
+- **Memory-mapped packs (opt-in)**: `filesystem.Options.MaxMappedPackBytes > 0` maps pack files read-only (Unix, bounded by
+  the cap, reference counted, least recently used mappings unmapped, `OnMappedPackBytes` / `MappedPacks` metrics, falls
+  back to `ReadAt`). A pack deleted by gc or repack stays mapped until its last reader closes or `Reindex`/`Close`; a
+  read that faults on a truncated file returns an error instead of crashing. It is **off by default** because on macOS it
+  cut CPU for reading blobs (-13% to -20%) and patch statistics (-13%) but made a tree diff 2.5x more expensive (page faults
+  on scattered small reads); Linux was not measured.
 - **Module line is unchanged** (`module github.com/go-git/go-git/v5`). The app consumes the fork with a
   `replace` directive, so import paths stay `github.com/go-git/go-git/v5`.
 - **Tags**: `vX.Y.Z-ssq.N` (never branch pseudo-versions). `v5.19.2-ssq.0` is the unmodified upstream

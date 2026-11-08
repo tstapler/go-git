@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-git/go-git/v5/plumbing"
@@ -37,7 +39,12 @@ type ObjectStorage struct {
 	packfiles   map[plumbing.Hash]*packfile.Packfile
 
 	// pool holds idle open pack handles for the default (no KeepDescriptors) mode; nil when disabled.
-	pool *packHandlePool[*packfile.Packfile]
+	pool *packHandlePool[plumbing.Hash, *packfile.Packfile]
+	// files lends raw pack file handles to lazily read objects (packfile.FSObject).
+	files *packHandlePool[string, billy.File]
+
+	// maps memory-maps pack files for read-syscall-free object reads; nil when disabled.
+	maps *packMapRegistry
 }
 
 // NewObjectStorage creates a new ObjectStorage with the given .git directory and cache.
@@ -52,6 +59,9 @@ func NewObjectStorageWithOptions(dir *dotgit.DotGit, objectCache cache.Object, o
 		objectCache: objectCache,
 		dir:         dir,
 	}
+	if ops.MaxMappedPackBytes > 0 {
+		s.maps = newPackMapRegistry(ops.MaxMappedPackBytes, ops.OnMappedPackBytes)
+	}
 	// On Windows an open handle blocks deleting the pack (repack, prune), so the pool is opt-in there.
 	poolByDefault := runtime.GOOS != "windows" || ops.MaxIdlePackHandles > 0
 	if !ops.KeepDescriptors && ops.MaxOpenDescriptors == 0 && ops.MaxIdlePackHandles >= 0 && poolByDefault {
@@ -59,9 +69,45 @@ func NewObjectStorageWithOptions(dir *dotgit.DotGit, objectCache cache.Object, o
 		if idle == 0 {
 			idle = defaultMaxIdlePackHandles
 		}
-		s.pool = newPackHandlePool[*packfile.Packfile](idle, ops.OnOpenPackHandles)
+		report := func(open int64) {}
+		if ops.OnOpenPackHandles != nil {
+			report = ops.OnOpenPackHandles
+		}
+		var objs, files atomic.Int64
+		s.pool = newPackHandlePool[plumbing.Hash, *packfile.Packfile](idle, func(n int64) { objs.Store(n); report(objs.Load() + files.Load()) })
+		s.files = newPackHandlePool[string, billy.File](idle, func(n int64) { files.Store(n); report(objs.Load() + files.Load()) })
 	}
 	return s
+}
+
+// maybeMap replaces an open pack file with a handle on its shared memory mapping when mapping is
+// enabled and possible, closing the original descriptor (the mapping does not need it). On any
+// failure the original file is returned and reads keep using ReadAt.
+func (s *ObjectStorage) maybeMap(f billy.File) billy.File {
+	if s.maps == nil {
+		return f
+	}
+	rooter, ok := s.dir.Fs().(interface{ Root() string })
+	if !ok {
+		return f
+	}
+	name := f.Name()
+	mf, err := s.maps.open(name, func() (*os.File, error) {
+		return os.Open(filepath.Join(rooter.Root(), name))
+	})
+	if err != nil {
+		return f
+	}
+	_ = f.Close()
+	return mf
+}
+
+// MappedPacks reports the total bytes and number of pack files currently memory-mapped.
+func (s *ObjectStorage) MappedPacks() (bytes int64, count int) {
+	if s.maps == nil {
+		return 0, 0
+	}
+	return s.maps.mappedBytes()
 }
 
 // OpenPackHandles reports how many packfile handles are currently open on behalf of the
@@ -71,7 +117,26 @@ func (s *ObjectStorage) OpenPackHandles() int64 {
 	if s.pool == nil {
 		return 0
 	}
-	return s.pool.open.Load()
+	return s.pool.open.Load() + s.files.open.Load()
+}
+
+// handleSource adapts the raw-file pool to packfile.HandleSource.
+type handleSource struct{ s *ObjectStorage }
+
+func (h handleSource) Borrow(path string) (billy.File, error) {
+	if f, ok := h.s.files.get(path); ok {
+		return f, nil
+	}
+	f, err := h.s.dir.Fs().Open(path)
+	if err != nil {
+		return nil, err
+	}
+	h.s.files.opened()
+	return h.s.maybeMap(f), nil
+}
+
+func (h handleSource) Return(path string, f billy.File) error {
+	return h.s.files.put(path, f)
 }
 
 // acquirePackfile returns an open packfile and a release function. With the idle-handle pool the
@@ -89,23 +154,24 @@ func (s *ObjectStorage) acquirePackfile(idx idxfile.Index, pack plumbing.Hash) (
 		return p, func() error { return nil }, nil
 	}
 
-	gen := s.pool.generation()
 	if p, ok := s.pool.get(pack); ok {
-		return p, func() error { return s.pool.put(pack, gen, p) }, nil
+		return p, func() error { return s.pool.put(pack, p) }, nil
 	}
 
 	f, err := s.dir.ObjectPack(pack)
 	if err != nil {
 		return nil, nil, err
 	}
+	f = s.maybeMap(f)
 	var p *packfile.Packfile
 	if s.objectCache != nil {
 		p = packfile.NewPackfileWithCache(idx, s.dir.Fs(), f, s.objectCache, s.options.LargeObjectThreshold)
 	} else {
 		p = packfile.NewPackfile(idx, s.dir.Fs(), f, s.options.LargeObjectThreshold)
 	}
+	p.SetHandleSource(handleSource{s})
 	s.pool.opened()
-	return p, func() error { return s.pool.put(pack, gen, p) }, nil
+	return p, func() error { return s.pool.put(pack, p) }, nil
 }
 
 func (s *ObjectStorage) requireIndex() error {
@@ -133,6 +199,10 @@ func (s *ObjectStorage) Reindex() {
 	s.index = nil
 	if s.pool != nil {
 		_ = s.pool.closeAll()
+		_ = s.files.closeAll()
+	}
+	if s.maps != nil {
+		s.maps.drop()
 	}
 }
 
@@ -284,6 +354,7 @@ func (s *ObjectStorage) packfile(idx idxfile.Index, pack plumbing.Hash) (*packfi
 	if err != nil {
 		return nil, err
 	}
+	f = s.maybeMap(f)
 
 	var p *packfile.Packfile
 	if s.objectCache != nil {
@@ -737,8 +808,14 @@ func (s *ObjectStorage) Close() error {
 	}
 
 	s.packfiles = nil
+	if s.maps != nil {
+		defer s.maps.shutdown()
+	}
 	if s.pool != nil {
-		if err := s.pool.closeAll(); firstError == nil && err != nil {
+		if err := s.pool.shutdown(); firstError == nil && err != nil {
+			firstError = err
+		}
+		if err := s.files.shutdown(); firstError == nil && err != nil {
 			firstError = err
 		}
 	}
@@ -978,6 +1055,10 @@ func (s *ObjectStorage) DeleteOldObjectPackAndIndex(h plumbing.Hash, t time.Time
 	if s.pool != nil {
 		// An idle handle would block deleting the pack on Windows and pin its space elsewhere.
 		_ = s.pool.closeAll()
+		_ = s.files.closeAll()
+	}
+	if s.maps != nil {
+		s.maps.drop()
 	}
 	return s.dir.DeleteOldObjectPackAndIndex(h, t)
 }

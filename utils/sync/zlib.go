@@ -5,13 +5,18 @@ import (
 	"compress/zlib"
 	"io"
 	"sync"
+
+	// Inflate is the hot path of every packed and loose object read; klauspost's decoder is
+	// measurably faster than the standard library's (pure Go, no cgo). Writers stay on compress/zlib
+	// because their *zlib.Writer type is part of this package's API.
+	kzlib "github.com/klauspost/compress/zlib"
 )
 
 var (
 	zlibInitBytes = []byte{0x78, 0x9c, 0x01, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01}
 	zlibReader    = sync.Pool{
 		New: func() interface{} {
-			r, _ := zlib.NewReader(bytes.NewReader(zlibInitBytes))
+			r, _ := kzlib.NewReader(bytes.NewReader(zlibInitBytes))
 			return ZLibReader{
 				Reader: r.(zlibReadCloser),
 			}
@@ -26,7 +31,7 @@ var (
 
 type zlibReadCloser interface {
 	io.ReadCloser
-	zlib.Resetter
+	kzlib.Resetter
 }
 
 type ZLibReader struct {

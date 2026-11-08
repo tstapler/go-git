@@ -24,6 +24,11 @@ type Options struct {
 	// correctly handling the "racy git" condition. If no index is provided,
 	// the function works without the optimization.
 	Index *index.Index
+	// IgnoreUntracked, when set, is asked about every directory entry that is not tracked in
+	// Index (a file with no entry, or a directory with no tracked descendants); entries it reports
+	// as ignored are left out of the tree, so an ignored directory is never walked. Tracked paths
+	// are always kept. It needs Index.
+	IgnoreUntracked func(path string, isDir bool) bool
 }
 
 // The node represents a file or a directory in a billy.Filesystem. It
@@ -36,6 +41,8 @@ type node struct {
 	submodules map[string]plumbing.Hash
 	idx        *index.Index
 	idxMap     map[string]*index.Entry
+	trackedDir map[string]struct{}
+	skipFn     func(path string, isDir bool) bool
 
 	path     string
 	hash     []byte
@@ -75,11 +82,23 @@ func NewRootNodeWithOptions(
 	options Options,
 ) noder.Noder {
 	var idxMap map[string]*index.Entry
+	var trackedDir map[string]struct{}
 
 	if options.Index != nil {
 		idxMap = make(map[string]*index.Entry, len(options.Index.Entries))
 		for _, entry := range options.Index.Entries {
 			idxMap[entry.Name] = entry
+		}
+		if options.IgnoreUntracked != nil {
+			trackedDir = make(map[string]struct{})
+			for _, entry := range options.Index.Entries {
+				for dir := path.Dir(entry.Name); dir != "." && dir != "/"; dir = path.Dir(dir) {
+					if _, ok := trackedDir[dir]; ok {
+						break
+					}
+					trackedDir[dir] = struct{}{}
+				}
+			}
 		}
 	}
 
@@ -88,8 +107,32 @@ func NewRootNodeWithOptions(
 		submodules: submodules,
 		idx:        options.Index,
 		idxMap:     idxMap,
+		trackedDir: trackedDir,
+		skipFn:     skipFn(options),
 		isDir:      true,
 	}
+}
+
+func skipFn(options Options) func(string, bool) bool {
+	if options.Index == nil {
+		return nil
+	}
+	return options.IgnoreUntracked
+}
+
+// skip reports whether an untracked, ignored entry should be left out of the tree.
+func (n *node) skip(p string, isDir bool) bool {
+	if n.skipFn == nil {
+		return false
+	}
+	if isDir {
+		if _, tracked := n.trackedDir[p]; tracked {
+			return false
+		}
+	} else if _, tracked := n.idxMap[p]; tracked {
+		return false
+	}
+	return n.skipFn(p, isDir)
 }
 
 // Hash the hash of a filesystem is the result of concatenating the computed
@@ -163,6 +206,10 @@ func (n *node) calculateChildren() error {
 			continue
 		}
 
+		if n.skip(path.Join(n.path, file.Name()), file.IsDir()) {
+			continue
+		}
+
 		c, err := n.newChildNode(file)
 		if err != nil {
 			return err
@@ -182,6 +229,8 @@ func (n *node) newChildNode(file os.FileInfo) (*node, error) {
 		submodules: n.submodules,
 		idx:        n.idx,
 		idxMap:     n.idxMap,
+		trackedDir: n.trackedDir,
+		skipFn:     n.skipFn,
 
 		path:    path,
 		isDir:   file.IsDir(),
