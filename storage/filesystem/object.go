@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 
@@ -51,7 +52,9 @@ func NewObjectStorageWithOptions(dir *dotgit.DotGit, objectCache cache.Object, o
 		objectCache: objectCache,
 		dir:         dir,
 	}
-	if !ops.KeepDescriptors && ops.MaxOpenDescriptors == 0 && ops.MaxIdlePackHandles >= 0 {
+	// On Windows an open handle blocks deleting the pack (repack, prune), so the pool is opt-in there.
+	poolByDefault := runtime.GOOS != "windows" || ops.MaxIdlePackHandles > 0
+	if !ops.KeepDescriptors && ops.MaxOpenDescriptors == 0 && ops.MaxIdlePackHandles >= 0 && poolByDefault {
 		idle := ops.MaxIdlePackHandles
 		if idle == 0 {
 			idle = defaultMaxIdlePackHandles

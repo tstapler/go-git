@@ -35,8 +35,9 @@ type Options struct {
 	// open. If KeepDescriptors is true, all file descriptors will remain open.
 	MaxOpenDescriptors int
 	// MaxIdlePackHandles bounds the open packfile handles kept idle between object reads when
-	// neither KeepDescriptors nor MaxOpenDescriptors is set. 0 selects a default of 32; a negative
-	// value disables the pool and reopens the pack for every read. Handles are closed by Close
+	// neither KeepDescriptors nor MaxOpenDescriptors is set. 0 selects a default of 32 (off on Windows,
+	// where an open handle blocks deleting the pack); a negative value disables the pool and reopens the pack
+	// for every read. Handles are closed by Close
 	// (or by the garbage collector if the storage is dropped without Close).
 	MaxIdlePackHandles int
 	// OnOpenPackHandles, when set, is called with the number of open pooled pack handles each time

@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/go-git/go-billy/v5"
@@ -646,7 +647,7 @@ func (s *FsSuite) TestPackHandlePoolReusesAndBoundsHandles(c *C) {
 		options Options
 		reuse   bool
 	}{
-		{"default pool", Options{}, true},
+		{"default pool", defaultPoolOptions(), true},
 		{"explicit bound", Options{MaxIdlePackHandles: 2}, true},
 		{"pool disabled", Options{MaxIdlePackHandles: -1}, false},
 	} {
@@ -743,4 +744,13 @@ func (s *FsSuite) TestPackHandlePoolConcurrentReadsStayBounded(c *C) {
 	c.Assert(o.OpenPackHandles() <= 2, Equals, true, Commentf("idle handles exceeded the bound: %d", o.OpenPackHandles()))
 	c.Assert(o.Close(), IsNil)
 	c.Assert(o.OpenPackHandles(), Equals, int64(0))
+}
+
+// defaultPoolOptions is the zero Options where the pool is on by default, and an explicit opt-in
+// on Windows, where it is off by default because open handles block deleting packs.
+func defaultPoolOptions() Options {
+	if runtime.GOOS == "windows" {
+		return Options{MaxIdlePackHandles: defaultMaxIdlePackHandles}
+	}
+	return Options{}
 }
