@@ -51,6 +51,13 @@ func readIgnoreFile(fs billy.Filesystem, path []string, ignoreFile string) (ps [
 // recursively traversing through the directory structure. The result is in
 // the ascending order of priority (last higher).
 func ReadPatterns(fs billy.Filesystem, path []string) (ps []Pattern, err error) {
+	return readPatterns(fs, path, nil)
+}
+
+// readPatterns is ReadPatterns with the patterns already collected from the ancestor directories,
+// so a directory ignored by an ancestor's pattern is not descended into (git never reads
+// .gitignore files inside an ignored directory). The returned patterns exclude inherited.
+func readPatterns(fs billy.Filesystem, path []string, inherited []Pattern) (ps []Pattern, err error) {
 	ps, _ = readIgnoreFile(fs, path, infoExcludeFile)
 
 	subps, _ := readIgnoreFile(fs, path, gitignoreFile)
@@ -64,12 +71,14 @@ func ReadPatterns(fs billy.Filesystem, path []string) (ps []Pattern, err error) 
 
 	for _, fi := range fis {
 		if fi.IsDir() && fi.Name() != gitDir {
-			if NewMatcher(ps).Match(append(path, fi.Name()), true) {
+			all := make([]Pattern, 0, len(inherited)+len(ps))
+			all = append(append(all, inherited...), ps...)
+			if NewMatcher(all).Match(append(path, fi.Name()), true) {
 				continue
 			}
 
 			var subps []Pattern
-			subps, err = ReadPatterns(fs, append(path, fi.Name()))
+			subps, err = readPatterns(fs, append(path, fi.Name()), all)
 			if err != nil {
 				return
 			}
