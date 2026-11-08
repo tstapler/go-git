@@ -32,11 +32,12 @@ type DiffTreeOptions struct {
 	// exactly between 0 and 100.
 	RenameScore uint
 	// RenameLimit bounds inexact (content-similarity) rename detection the
-	// way git's diff.renameLimit does: after exact renames are paired off,
-	// detection is skipped when the remaining added and deleted counts
-	// are both above the limit, or when added*deleted > RenameLimit^2
-	// (git's too_many_rename_candidates in diffcore-rename.c). Exact renames
-	// are always detected. git's default is 1000; see DefaultRenameLimit.
+	// way git's diff.renameLimit does: after exact renames and the basename
+	// pre-pass have paired files off, detection is skipped when the remaining
+	// added and deleted counts are both above the limit, or when
+	// added*deleted > RenameLimit^2 (git's too_many_rename_candidates in
+	// diffcore-rename.c). Exact and basename-matched renames are always
+	// detected. git's default is 1000; see DefaultRenameLimit.
 	// A value of 0 means no limit.
 	RenameLimit uint
 	// OnlyExactRenames performs only detection of exact renames and will not perform
