@@ -4,6 +4,7 @@ package filesystem
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -136,6 +137,9 @@ func TestPackMapRegistry_ShouldSurviveDeletionOfTheMappedFile(t *testing.T) {
 		go func(w int) {
 			defer wg.Done()
 			h, err := reg.open(path, opener(path))
+			if errors.Is(err, errMmapUnsupported) {
+				return // opened after the drop: a dropped mapping is never reused, callers fall back to ReadAt
+			}
 			if err != nil {
 				errs <- err
 				return

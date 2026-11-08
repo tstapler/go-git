@@ -108,7 +108,9 @@ func (r *packMapRegistry) evictLocked(need int64) {
 }
 
 func (r *packMapRegistry) unmapLocked(m *packMapping) {
-	delete(r.maps, m.path)
+	if r.maps[m.path] == m {
+		delete(r.maps, m.path)
+	}
 	r.bytes -= int64(len(m.data))
 	_ = unmapBytes(m.data)
 	m.data = nil
@@ -133,7 +135,9 @@ func (r *packMapRegistry) drop() {
 		if m.refs == 0 {
 			r.unmapLocked(m)
 		} else {
+			// Out of the registry so a replaced pack of the same name is never served from it.
 			m.dead = true
+			delete(r.maps, m.path)
 		}
 	}
 }

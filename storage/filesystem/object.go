@@ -1052,5 +1052,9 @@ func (s *ObjectStorage) ObjectPacks() ([]plumbing.Hash, error) {
 }
 
 func (s *ObjectStorage) DeleteOldObjectPackAndIndex(h plumbing.Hash, t time.Time) error {
+	if s.pool != nil {
+		// An idle handle would block deleting the pack on Windows and pin its space elsewhere.
+		_ = s.pool.closeAll()
+	}
 	return s.dir.DeleteOldObjectPackAndIndex(h, t)
 }

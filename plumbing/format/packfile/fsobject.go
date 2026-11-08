@@ -2,6 +2,7 @@ package packfile
 
 import (
 	"io"
+	"sync"
 
 	billy "github.com/go-git/go-billy/v5"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -36,7 +37,13 @@ func (o *FSObject) open() (billy.File, func() error, error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		return f, func() error { return o.src.Return(o.path, f) }, nil
+		var once sync.Once
+		var rerr error
+		// Idempotent: a second Close of the returned reader must not park the handle twice.
+		return f, func() error {
+			once.Do(func() { rerr = o.src.Return(o.path, f) })
+			return rerr
+		}, nil
 	}
 	f, err := o.fs.Open(o.path)
 	if err != nil {
@@ -92,6 +99,7 @@ func (o *FSObject) Reader() (io.ReadCloser, error) {
 		// We have a big object
 		h, err := p.objectHeaderAtOffset(o.offset)
 		if err != nil {
+			_ = release()
 			return nil, err
 		}
 
