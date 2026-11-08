@@ -159,3 +159,18 @@ func TestDetectRenames_FileTypes_MatchesGitCLI(t *testing.T) {
 		t.Fatalf("expected 5 renames (3 inexact regular/executable, exact exe->reg, exact symlink), got %v", got)
 	}
 }
+
+// A duplicate-content group mixing regular files and symlinks must not pair across types.
+func TestDetectRenames_MixedRegularAndSymlinkDuplicateGroup_MatchesGitCLI(t *testing.T) {
+	before := []parityFile{
+		{"a/x", "tgt", filemode.Regular},
+		{"b/y", "tgt", filemode.Regular},
+	}
+	after := []parityFile{
+		{"c/y", "tgt", filemode.Symlink},
+		{"c/x", "tgt", filemode.Symlink},
+	}
+	if got := assertParity(t, before, after, 50, 1000); len(got) != 0 {
+		t.Fatalf("expected no renames across regular/symlink, got %v", got)
+	}
+}

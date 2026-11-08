@@ -142,6 +142,10 @@ func (d *renameDetector) detectExactRenames() {
 				for addIdx, add := range added {
 					addedName := changeName(add)
 
+					if !sameMode(del, add) {
+						continue
+					}
+
 					score := nameSimilarityScore(addedName, deletedName)
 					matrix = append(matrix, similarityPair{added: addIdx, deleted: delIdx, score: score})
 
