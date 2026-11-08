@@ -13,6 +13,27 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/filemode"
 )
 
+// minOracleGit is the oldest git these tests are written against. Rename detection changed
+// across git releases (basename matching and a stable sort arrived in 2.31/2.32 with the
+// merge-ort work), so older gits, such as the 2.11 leg of the fork CI, are not a valid oracle.
+const minOracleGitMajor, minOracleGitMinor = 2, 31
+
+// requireGitOracle skips the test unless a recent enough git is installed.
+func requireGitOracle(t *testing.T) {
+	t.Helper()
+	out, err := exec.Command("git", "--version").Output()
+	if err != nil {
+		t.Skip("git not installed")
+	}
+	var major, minor int
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(out)), "git version %d.%d", &major, &minor); err != nil {
+		t.Skipf("cannot parse %q", out)
+	}
+	if major < minOracleGitMajor || (major == minOracleGitMajor && minor < minOracleGitMinor) {
+		t.Skipf("git %d.%d is older than %d.%d, whose rename detection differs", major, minor, minOracleGitMajor, minOracleGitMinor)
+	}
+}
+
 type parityFile struct {
 	path    string
 	content string // symlink target for symlinks
@@ -23,9 +44,7 @@ type parityFile struct {
 // `git diff --name-status -M<score>% -l<limit>` reports as renames.
 func gitRenames(t *testing.T, before, after []parityFile, score, limit int) []string {
 	t.Helper()
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git not installed")
-	}
+	requireGitOracle(t)
 	dir := t.TempDir()
 	run := func(args ...string) string {
 		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)

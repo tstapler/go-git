@@ -17,7 +17,7 @@ This is a public fork of [go-git/go-git](https://github.com/go-git/go-git) used 
     changes the mode, is now detected; upstream v5.19.3 did not), inexact detection needs two
     regular/executable files, and symlinks pair only (exactly) with symlinks. The exact pass is also never
     limited by `RenameLimit`. `v5.19.3-ssq.4`.
-- **Oracle-tested against `git diff -M`** (`plumbing/object/rename_git_parity_test.go`, `rename_cache_test.go`):
+- **Oracle-tested against `git diff -M`** (git 2.31 or newer; the tests skip on older gits, whose rename detection differs, such as the 2.11 CI leg) (`plumbing/object/rename_git_parity_test.go`, `rename_cache_test.go`):
   50 and 1100 identical files above the limit; regular/executable/symlink combinations, exact and inexact;
   a duplicate group mixing regular files and symlinks; one 12-file content rename.
 - **Known divergences from git, not fixed here** (some are upstream behaviour):
