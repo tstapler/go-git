@@ -130,10 +130,9 @@ func (d *renameDetector) detectExactRenames() {
 				addedLeft = append(addedLeft, added...)
 			}
 		} else if len(deleted) > 1 {
+			// No rename limit here: git's exact pass is unbounded, the limit only
+			// gates the inexact (content similarity) matrix.
 			maxSize := len(deleted) * len(added)
-			if d.renameLimit > 0 && d.renameLimit < maxSize {
-				maxSize = d.renameLimit
-			}
 
 			matrix := make(similarityMatrix, 0, maxSize)
 
@@ -142,6 +141,10 @@ func (d *renameDetector) detectExactRenames() {
 
 				for addIdx, add := range added {
 					addedName := changeName(add)
+
+					if !sameMode(del, add) {
+						continue
+					}
 
 					score := nameSimilarityScore(addedName, deletedName)
 					matrix = append(matrix, similarityPair{added: addIdx, deleted: delIdx, score: score})
@@ -372,8 +375,17 @@ func changeMode(c *Change) filemode.FileMode {
 	return c.From.TreeEntry.Mode
 }
 
+// sameMode reports whether two changes may be paired as an exact rename. Like git
+// (diffcore-rename.c), a regular and an executable file pair with each other; a
+// symlink pairs only with a symlink.
 func sameMode(a, b *Change) bool {
-	return changeMode(a) == changeMode(b)
+	ma, mb := changeMode(a), changeMode(b)
+	return ma == mb || (isRegularFile(ma) && isRegularFile(mb))
+}
+
+// isRegularFile is git's S_ISREG: regular and executable files, not symlinks or submodules.
+func isRegularFile(m filemode.FileMode) bool {
+	return m == filemode.Regular || m == filemode.Executable || m == filemode.Deprecated
 }
 
 func groupChangesByHash(changes []*Change) map[plumbing.Hash][]*Change {
@@ -464,7 +476,13 @@ func (c *similarityIndexCache) get(idx int, file func() (*File, error)) (*simila
 }
 
 func buildSimilarityMatrix(srcs, dsts []*Change, renameScore int) (similarityMatrix, error) {
-	dstIndexes := newSimilarityIndexCache(maxCachedIndexBytes)
+	return buildSimilarityMatrixWithBudget(srcs, dsts, renameScore, maxCachedIndexBytes)
+}
+
+// buildSimilarityMatrixWithBudget is buildSimilarityMatrix with an explicit
+// destination-index cache budget in bytes; the result never depends on it.
+func buildSimilarityMatrixWithBudget(srcs, dsts []*Change, renameScore, cacheBudget int) (similarityMatrix, error) {
+	dstIndexes := newSimilarityIndexCache(cacheBudget)
 	// Allocate for the worst-case scenario where every pair has a score
 	// that we need to consider. We might not need that many.
 	matrixSize := len(srcs) * len(dsts)
@@ -481,7 +499,7 @@ func buildSimilarityMatrix(srcs, dsts []*Change, renameScore int) (similarityMat
 	// later find the best matches.
 outerLoop:
 	for srcIdx, src := range srcs {
-		if changeMode(src) != filemode.Regular {
+		if !isRegularFile(changeMode(src)) {
 			continue
 		}
 
@@ -494,7 +512,7 @@ outerLoop:
 		var s *similarityIndex
 		var err error
 		for dstIdx, dst := range dsts {
-			if changeMode(dst) != filemode.Regular {
+			if !isRegularFile(changeMode(dst)) {
 				continue
 			}
 

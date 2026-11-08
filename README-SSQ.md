@@ -6,12 +6,29 @@ This is a public fork of [go-git/go-git](https://github.com/go-git/go-git) used 
 - **Patches**: `ssq/v5` is upstream `v5.19.3` plus fork-only files (`.github/workflows/ssq-ci.yml`, this
   README) and these Go changes:
   - accept the `worktreeConfig`, `partialClone` and `preciousObjects` repository extensions (`v5.19.3-ssq.2`);
-  - git-exact `RenameLimit` in `plumbing/object` rename detection: git's `too_many_rename_candidates`
-    product rule instead of `max(added, deleted) > limit` (`v5.19.3-ssq.4`). Behaviour change only for a
-    non-zero `RenameLimit`; `0` still means no limit;
+  - git's `RenameLimit` rule in `plumbing/object` rename detection: `too_many_rename_candidates`'s
+    product rule instead of `max(added, deleted) > limit`. This changes results only for a non-zero
+    `RenameLimit`; `0` still means no limit. `v5.19.3-ssq.4`;
   - `buildSimilarityMatrix` builds each destination's similarity index once (bounded cache, 128 MiB, falls
     back to per-pair rebuild) instead of once per source/destination pair; output is identical (differential
-    test against the old implementation). `v5.19.3-ssq.4`.
+    test against the previous implementation). `v5.19.3-ssq.4`;
+  - rename pairing by file type, which **does change results for default `RenameLimit` 0 callers**: regular
+    and executable files now pair with each other (an executable renamed and edited, or a rename that
+    changes the mode, is now detected; upstream v5.19.3 did not), inexact detection needs two
+    regular/executable files, and symlinks pair only (exactly) with symlinks. The exact pass is also never
+    limited by `RenameLimit`. `v5.19.3-ssq.4`.
+- **Oracle-tested against `git diff -M`** (`plumbing/object/rename_git_parity_test.go`, `rename_cache_test.go`):
+  50 and 1100 identical files above the limit; regular/executable/symlink combinations, exact and inexact;
+  a duplicate group mixing regular files and symlinks; one 12-file content rename.
+- **Known divergences from git, not fixed here** (some are upstream behaviour):
+  1. Equal-score ties among identical-content duplicates: git picks the first path in sorted order, go-git
+     the last.
+  2. Basename preference: git pairs same-basename files first (`find_basename_matches`); go-git scores by
+     directory similarity. Example: delete `a/x.txt`, `b/y.txt`, add `b/x.txt`, `a/y.txt`: git gives
+     `a/x->b/x`, `b/y->a/y`; go-git gives `a/x->a/y`, `b/y->b/x`.
+  3. git's basename pre-pass can pair a file even when the product rule says to skip inexact detection
+     (limit 2, deleted `e/z.go`, `e/w`; added edited `b/z.go`, empty `a/w`, a symlink: git pairs
+     `e/z.go->b/z.go`, go-git none).
 - **Module line is unchanged** (`module github.com/go-git/go-git/v5`). The app consumes the fork with a
   `replace` directive, so import paths stay `github.com/go-git/go-git/v5`.
 - **Tags**: `vX.Y.Z-ssq.N` (never branch pseudo-versions). `v5.19.2-ssq.0` is the unmodified upstream
