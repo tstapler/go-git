@@ -3,6 +3,7 @@ package index
 import (
 	"bufio"
 	"bytes"
+	stdbinary "encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/filemode"
 	"github.com/go-git/go-git/v5/plumbing/hash"
 	"github.com/go-git/go-git/v5/utils/binary"
 )
@@ -39,6 +41,8 @@ const (
 	skipWorkTreeMask  = 1 << 14
 )
 
+var bigEndian = stdbinary.BigEndian
+
 // A Decoder reads and decodes index files from an input stream.
 type Decoder struct {
 	buf       *bufio.Reader
@@ -47,6 +51,11 @@ type Decoder struct {
 	lastEntry *Entry
 
 	extReader *bufio.Reader
+
+	slab    []Entry                 // unused tail of the current Entry allocation chunk
+	nameBuf []byte                  // scratch for V2/V3 names, so each name costs one string allocation
+	hdr     [entryHeaderLength]byte // fixed entry header; a field because a local would escape through io.Reader
+	pad     [8]byte                 // V2/V3 entry padding (at most 8 bytes)
 }
 
 // NewDecoder returns a new decoder that reads from r.
@@ -96,28 +105,41 @@ func (d *Decoder) readEntries(idx *Index, count int) error {
 	return nil
 }
 
-func (d *Decoder) readEntry(idx *Index) (*Entry, error) {
-	e := &Entry{}
+// entryChunk is how many Entry values are allocated at once. The header count
+// is untrusted, so the slab grows in fixed chunks instead of one make(count).
+const entryChunk = 256
 
-	var msec, mnsec, sec, nsec uint32
-	var flags uint16
-
-	flow := []interface{}{
-		&sec, &nsec,
-		&msec, &mnsec,
-		&e.Dev,
-		&e.Inode,
-		&e.Mode,
-		&e.UID,
-		&e.GID,
-		&e.Size,
-		&e.Hash,
-		&flags,
+// newEntry returns a zeroed Entry from the current slab.
+func (d *Decoder) newEntry() *Entry {
+	if len(d.slab) == 0 {
+		d.slab = make([]Entry, entryChunk)
 	}
+	e := &d.slab[0]
+	d.slab = d.slab[1:]
+	return e
+}
 
-	if err := binary.Read(d.r, flow...); err != nil {
+func (d *Decoder) readEntry(idx *Index) (*Entry, error) {
+	e := d.newEntry()
+
+	// One read of the fixed-size header. encoding/binary.Read allocated per
+	// field (about 27 allocations per entry); decoding from a stack buffer
+	// allocates none.
+	hdr := d.hdr[:]
+	if _, err := io.ReadFull(d.r, hdr); err != nil {
 		return nil, err
 	}
+	be := bigEndian
+	sec, nsec := be.Uint32(hdr[0:]), be.Uint32(hdr[4:])
+	msec, mnsec := be.Uint32(hdr[8:]), be.Uint32(hdr[12:])
+	e.Dev = be.Uint32(hdr[16:])
+	e.Inode = be.Uint32(hdr[20:])
+	e.Mode = filemode.FileMode(be.Uint32(hdr[24:]))
+	e.UID = be.Uint32(hdr[28:])
+	e.GID = be.Uint32(hdr[32:])
+	e.Size = be.Uint32(hdr[36:])
+	copy(e.Hash[:], hdr[40:40+len(e.Hash)])
+	flags := be.Uint16(hdr[40+len(e.Hash):])
 
 	read := entryHeaderLength
 
@@ -188,7 +210,10 @@ func (d *Decoder) doReadEntryName(nameLen uint16) (string, int, error) {
 		return string(name), len(name) + 1, nil // +1 for the consumed NUL delimiter
 	}
 
-	name := make([]byte, nameLen)
+	if cap(d.nameBuf) < int(nameLen) {
+		d.nameBuf = make([]byte, nameLen)
+	}
+	name := d.nameBuf[:nameLen]
 	_, err := io.ReadFull(d.r, name)
 	return string(name), int(nameLen), err
 }
@@ -232,7 +257,8 @@ func (d *Decoder) padEntry(idx *Index, e *Entry, read, nameConsumed int) error {
 	padLen := 8 - entrySize%8
 	padLen -= nameConsumed - len(e.Name)
 	if padLen > 0 {
-		_, err := io.CopyN(io.Discard, d.r, int64(padLen))
+		// padLen is at most 8; ReadFull into a field avoids io.CopyN's LimitedReader.
+		_, err := io.ReadFull(d.r, d.pad[:padLen])
 		return err
 	}
 	return nil
