@@ -8,7 +8,10 @@ This is a public fork of [go-git/go-git](https://github.com/go-git/go-git) used 
   - accept the `worktreeConfig`, `partialClone` and `preciousObjects` repository extensions (`v5.19.3-ssq.2`);
   - git-exact `RenameLimit` in `plumbing/object` rename detection: git's `too_many_rename_candidates`
     product rule instead of `max(added, deleted) > limit` (`v5.19.3-ssq.4`). Behaviour change only for a
-    non-zero `RenameLimit`; `0` still means no limit.
+    non-zero `RenameLimit`; `0` still means no limit;
+  - `buildSimilarityMatrix` builds each destination's similarity index once (bounded cache, 128 MiB, falls
+    back to per-pair rebuild) instead of once per source/destination pair; output is identical (differential
+    test against the old implementation). `v5.19.3-ssq.4`.
 - **Module line is unchanged** (`module github.com/go-git/go-git/v5`). The app consumes the fork with a
   `replace` directive, so import paths stay `github.com/go-git/go-git/v5`.
 - **Tags**: `vX.Y.Z-ssq.N` (never branch pseudo-versions). `v5.19.2-ssq.0` is the unmodified upstream
