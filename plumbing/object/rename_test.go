@@ -18,25 +18,6 @@ type RenameSuite struct {
 
 var _ = Suite(&RenameSuite{})
 
-func (s *RenameSuite) TestNameSimilarityScore(c *C) {
-	testCases := []struct {
-		a, b  string
-		score int
-	}{
-		{"foo/bar.c", "foo/baz.c", 70},
-		{"src/utils/Foo.java", "tests/utils/Foo.java", 64},
-		{"foo/bar/baz.py", "README.md", 0},
-		{"src/utils/something/foo.py", "src/utils/something/other/foo.py", 69},
-		{"src/utils/something/foo.py", "src/utils/yada/foo.py", 63},
-		{"src/utils/something/foo.py", "src/utils/something/other/bar.py", 44},
-		{"src/utils/something/foo.py", "src/utils/something/foo.py", 100},
-	}
-
-	for _, tt := range testCases {
-		c.Assert(nameSimilarityScore(tt.a, tt.b), Equals, tt.score)
-	}
-}
-
 const (
 	pathA = "src/A"
 	pathB = "src/B"

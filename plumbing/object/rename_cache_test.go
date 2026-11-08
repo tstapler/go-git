@@ -75,20 +75,38 @@ func randomSides(tb testing.TB, rng *rand.Rand, nSrc, nDst int) (srcs, dsts []*C
 	return srcs, dsts
 }
 
-// The cached matrix must equal the uncached reference pair for pair (scores, ties and
-// order) whether the cache holds every destination index, only some of them (the
-// over-budget fallback rebuilds the rest per pair), or none.
-func TestBuildSimilarityMatrix_DifferentialAgainstUncached(t *testing.T) {
+// detectWithBudget runs rename detection over a copy of the changes with a given
+// source-index cache budget (0 default, negative none).
+func detectWithBudget(t testing.TB, srcs, dsts []*Change, score, budget int) []string {
+	t.Helper()
+	d := &renameDetector{renameScore: score, indexCacheBudget: budget}
+	d.deleted = append([]*Change(nil), srcs...)
+	d.added = append([]*Change(nil), dsts...)
+	result, err := d.detect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pairs []string
+	for _, c := range result {
+		if c.From.Name != "" && c.To.Name != "" {
+			pairs = append(pairs, c.From.Name+" "+c.To.Name)
+		}
+	}
+	return pairs
+}
+
+// Pairings must not depend on the index cache: with the full budget, a budget that holds only
+// a couple of source indexes (the over-budget fallback rebuilds the rest per use) and none.
+func TestDetectRenames_ShouldNotDependOnIndexCacheBudget(t *testing.T) {
 	// A small index is 256 entries x 8 bytes = 2048 bytes, so 5000 holds two of them.
-	for _, budget := range []int{maxCachedIndexBytes, 5000, 0} {
-		for seed := int64(0); seed < 200; seed++ {
-			rng := rand.New(rand.NewSource(seed))
-			srcs, dsts := randomSides(t, rng, 1+rng.Intn(25), 1+rng.Intn(25))
-			for _, score := range []int{30, 60} {
-				want, wantErr := buildSimilarityMatrixUncached(srcs, dsts, score)
-				got, gotErr := buildSimilarityMatrixWithBudget(srcs, dsts, score, budget)
-				if (wantErr == nil) != (gotErr == nil) || !reflect.DeepEqual(want, got) {
-					t.Fatalf("budget %d seed %d score %d: matrix differs (errs %v / %v)", budget, seed, score, wantErr, gotErr)
+	for seed := int64(0); seed < 200; seed++ {
+		rng := rand.New(rand.NewSource(seed))
+		srcs, dsts := randomSides(t, rng, 1+rng.Intn(25), 1+rng.Intn(25))
+		for _, score := range []int{30, 60} {
+			want := detectWithBudget(t, srcs, dsts, score, -1)
+			for _, budget := range []int{0, 5000} {
+				if got := detectWithBudget(t, srcs, dsts, score, budget); !reflect.DeepEqual(want, got) {
+					t.Fatalf("budget %d seed %d score %d: pairs differ\n none: %v\n got:  %v", budget, seed, score, want, got)
 				}
 			}
 		}
@@ -192,143 +210,20 @@ func benchSides(b *testing.B, n int) (srcs, dsts []*Change) {
 	return srcs, dsts
 }
 
-// Run with `&` appended (squad convention): go test ./plumbing/object -run xxx -bench BuildSimilarityMatrix -benchmem &
-func BenchmarkBuildSimilarityMatrix(b *testing.B) {
+// Run with `&` appended (squad convention): go test ./plumbing/object -run xxx -bench DetectRenames -benchmem &
+func BenchmarkDetectRenames(b *testing.B) {
 	for _, n := range []int{120, 400, 1000} {
 		srcs, dsts := benchSides(b, n)
-		b.Run(fmt.Sprintf("cached/%d", n), func(b *testing.B) {
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				if _, err := buildSimilarityMatrix(srcs, dsts, 60); err != nil {
-					b.Fatal(err)
-				}
-			}
-		})
-		if n <= 400 {
-			b.Run(fmt.Sprintf("uncached/%d", n), func(b *testing.B) {
+		for _, tc := range []struct {
+			name   string
+			budget int
+		}{{"cached", 0}, {"uncached", -1}} {
+			b.Run(fmt.Sprintf("%s/%d", tc.name, n), func(b *testing.B) {
 				b.ReportAllocs()
 				for i := 0; i < b.N; i++ {
-					if _, err := buildSimilarityMatrixUncached(srcs, dsts, 60); err != nil {
-						b.Fatal(err)
-					}
+					detectWithBudget(b, srcs, dsts, 60, tc.budget)
 				}
 			})
 		}
 	}
-}
-
-// Reference copy of buildSimilarityMatrix from before destination indexes were cached.
-func buildSimilarityMatrixUncached(srcs, dsts []*Change, renameScore int) (similarityMatrix, error) {
-	// Allocate for the worst-case scenario where every pair has a score
-	// that we need to consider. We might not need that many.
-	matrixSize := len(srcs) * len(dsts)
-	if matrixSize > maxMatrixSize {
-		matrixSize = maxMatrixSize
-	}
-	matrix := make(similarityMatrix, 0, matrixSize)
-	srcSizes := make([]int64, len(srcs))
-	dstSizes := make([]int64, len(dsts))
-	dstTooLarge := make(map[int]bool)
-
-	// Consider each pair of files, if the score is above the minimum
-	// threshold we need to record that scoring in the matrix so we can
-	// later find the best matches.
-outerLoop:
-	for srcIdx, src := range srcs {
-		if !isRegularFile(changeMode(src)) {
-			continue
-		}
-
-		// Declare the from file and the similarity index here to be able to
-		// reuse it inside the inner loop. The reason to not initialize them
-		// here is so we can skip the initialization in case they happen to
-		// not be needed later. They will be initialized inside the inner
-		// loop if and only if they're needed and reused in subsequent passes.
-		var from *File
-		var s *similarityIndex
-		var err error
-		for dstIdx, dst := range dsts {
-			if !isRegularFile(changeMode(dst)) {
-				continue
-			}
-
-			if dstTooLarge[dstIdx] {
-				continue
-			}
-
-			var to *File
-			srcSize := srcSizes[srcIdx]
-			if srcSize == 0 {
-				from, _, err = src.Files()
-				if err != nil {
-					return nil, err
-				}
-				srcSize = from.Size + 1
-				srcSizes[srcIdx] = srcSize
-			}
-
-			dstSize := dstSizes[dstIdx]
-			if dstSize == 0 {
-				_, to, err = dst.Files()
-				if err != nil {
-					return nil, err
-				}
-				dstSize = to.Size + 1
-				dstSizes[dstIdx] = dstSize
-			}
-
-			min, max := srcSize, dstSize
-			if dstSize < srcSize {
-				min = dstSize
-				max = srcSize
-			}
-
-			if int(min*100/max) < renameScore {
-				// File sizes are too different to be a match
-				continue
-			}
-
-			if s == nil {
-				s, err = fileSimilarityIndex(from)
-				if err != nil {
-					if err == errIndexFull {
-						continue outerLoop
-					}
-					return nil, err
-				}
-			}
-
-			if to == nil {
-				_, to, err = dst.Files()
-				if err != nil {
-					return nil, err
-				}
-			}
-
-			di, err := fileSimilarityIndex(to)
-			if err != nil {
-				if err == errIndexFull {
-					dstTooLarge[dstIdx] = true
-				}
-
-				return nil, err
-			}
-
-			contentScore := s.score(di, 10000)
-			// The name score returns a value between 0 and 100, so we need to
-			// convert it to the same range as the content score.
-			nameScore := nameSimilarityScore(src.From.Name, dst.To.Name) * 100
-			score := (contentScore*99 + nameScore*1) / 10000
-
-			if score < renameScore {
-				continue
-			}
-
-			matrix = append(matrix, similarityPair{added: dstIdx, deleted: srcIdx, score: score})
-		}
-	}
-
-	sort.Stable(matrix)
-
-	return matrix, nil
 }

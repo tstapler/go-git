@@ -9,7 +9,7 @@ This is a public fork of [go-git/go-git](https://github.com/go-git/go-git) used 
   - git's `RenameLimit` rule in `plumbing/object` rename detection: `too_many_rename_candidates`'s
     product rule instead of `max(added, deleted) > limit`. This changes results only for a non-zero
     `RenameLimit`; `0` still means no limit. `v5.19.3-ssq.4`;
-  - `buildSimilarityMatrix` builds each destination's similarity index once (bounded cache, 128 MiB, falls
+  - the similarity matrix builds each file's similarity index once (bounded cache, 128 MiB, falls
     back to per-pair rebuild) instead of once per source/destination pair; output is identical (differential
     test against the previous implementation). `v5.19.3-ssq.4`;
   - rename pairing by file type, which **does change results for default `RenameLimit` 0 callers**: regular
@@ -20,15 +20,34 @@ This is a public fork of [go-git/go-git](https://github.com/go-git/go-git) used 
 - **Oracle-tested against `git diff -M`** (git 2.31 or newer; the tests skip on older gits, whose rename detection differs, such as the 2.11 CI leg) (`plumbing/object/rename_git_parity_test.go`, `rename_cache_test.go`):
   50 and 1100 identical files above the limit; regular/executable/symlink combinations, exact and inexact;
   a duplicate group mixing regular files and symlinks; one 12-file content rename.
-- **Known divergences from git, not fixed here** (some are upstream behaviour):
-  1. Equal-score ties among identical-content duplicates: git picks the first path in sorted order, go-git
-     the last.
-  2. Basename preference: git pairs same-basename files first (`find_basename_matches`); go-git scores by
-     directory similarity. Example: delete `a/x.txt`, `b/y.txt`, add `b/x.txt`, `a/y.txt`: git gives
-     `a/x->b/x`, `b/y->a/y`; go-git gives `a/x->a/y`, `b/y->b/x`.
-  3. git's basename pre-pass can pair a file even when the product rule says to skip inexact detection
-     (limit 2, deleted `e/z.go`, `e/w`; added edited `b/z.go`, empty `a/w`, a symlink: git pairs
-     `e/z.go->b/z.go`, go-git none).
+- **Git two-phase pairing** (stacked change, `v5.19.3-ssq.5`; tag names are placeholders renamed at tag
+  time): detection follows git's `diffcore_rename`:
+  1. exact renames: destinations in path order; the unused source with the same basename wins, else the
+     first in path order;
+  2. `find_basename_matches`: a deleted and an added file whose basename is unique among the remaining
+     deleted and among the remaining added files pair when their similarity reaches git's
+     `min_basename_score`, the minimum score plus **half the gap to 100%** (`-M50` needs 75%, `-M60` 80%,
+     `-M90` 95%), before the rename limit applies;
+  3. the content matrix, scored by content only, emulating git directly: per destination in path order a
+     4-slot array (`NUM_CANDIDATE_PER_DST`) filled by `record_if_better` over every source (sources that
+     cannot match, such as symlinks or files of very different size, count as score 0 and still occupy
+     slots), basename equality as the tie-break (`name_score`), then a stable sort in git's `score_compare`
+     order. Equal-score ties therefore follow git's slot order.
+
+  **Changed pairings versus upstream v5.19.3 for default `RenameLimit` 0 callers**: (1) among identical
+  files the first sorted path is chosen, not the last; (2) a same-basename pair beats a pair chosen by
+  directory similarity; (3) the 1% name-similarity blend is gone from content scores, so near-threshold
+  pairs can flip; (4) the basename pre-pass runs first and demands a higher score than the matrix.
+  Oracle-tested against `git diff -M -l<N>` (git 2.31 or newer): the divergences found in review, 60 small
+  randomized fixtures, and 150 broad ones (identical-content groups next to an edited copy, symlink and
+  unrelated sources, shared basenames, scores 30/50/60, limits 0 to 1000).
+- **Remaining known divergences from git**: content similarity is jgit's hashed-span estimate, not git's
+  byte-weighted `estimate_similarity`, so pairs within a few percent of a threshold can differ (the
+  fixtures keep clear of those zones); copies (`-C`), break detection (`-B`) and `merge.renameLimit` are not
+  modelled. Git 2.11 uses an unstable `QSORT` for the matrix and has no basename pre-pass, so it is not an
+  oracle (git 2.31 or newer, with `STABLE_QSORT`, is).
+- **Performance note**: the basename pre-pass builds both indexes for each candidate pair and does not use
+  the source-index cache, so a failed pre-pass pair costs up to twice the indexing of the cached path.
 - **Module line is unchanged** (`module github.com/go-git/go-git/v5`). The app consumes the fork with a
   `replace` directive, so import paths stay `github.com/go-git/go-git/v5`.
 - **Tags**: `vX.Y.Z-ssq.N` (never branch pseudo-versions). `v5.19.2-ssq.0` is the unmodified upstream
