@@ -386,3 +386,51 @@ func (s *NoderSuite) TestZeroIndexModTime(c *C) {
 
 	c.Assert(expectedHash, DeepEquals, fileHash, Commentf("should hash actual file content when idx.ModTime is zero, not use stale index hash"))
 }
+
+// readDirCounter counts ReadDir calls per directory.
+type readDirCounter struct {
+	billy.Filesystem
+	reads map[string]int
+}
+
+func (r *readDirCounter) ReadDir(p string) ([]os.FileInfo, error) {
+	r.reads[p]++
+	return r.Filesystem.ReadDir(p)
+}
+
+// Untracked entries reported as ignored must not be walked, while tracked paths are always
+// kept, even inside an ignored directory.
+func (s *NoderSuite) TestIgnoreUntrackedSkipsIgnoredDirectories(c *C) {
+	mem := memfs.New()
+	WriteFile(mem, "src/a.go", []byte("a"), 0644)
+	WriteFile(mem, "build/out.o", []byte("o"), 0644)
+	WriteFile(mem, "build/deep/more.o", []byte("o"), 0644)
+	WriteFile(mem, "vendor/tracked.go", []byte("t"), 0644)
+	WriteFile(mem, "vendor/junk.o", []byte("j"), 0644)
+	fs := &readDirCounter{Filesystem: mem, reads: map[string]int{}}
+
+	idx := &index.Index{Entries: []*index.Entry{{Name: "src/a.go"}, {Name: "vendor/tracked.go"}}}
+	ignored := func(p string, isDir bool) bool {
+		return p == "build" || path.Ext(p) == ".o"
+	}
+	root := NewRootNodeWithOptions(fs, nil, Options{Index: idx, IgnoreUntracked: ignored})
+
+	var seen []string
+	var walk func(n noder.Noder, prefix string)
+	walk = func(n noder.Noder, prefix string) {
+		children, err := n.Children()
+		c.Assert(err, IsNil)
+		for _, ch := range children {
+			p := path.Join(prefix, ch.Name())
+			seen = append(seen, p)
+			if ch.IsDir() {
+				walk(ch, p)
+			}
+		}
+	}
+	walk(root, "")
+
+	c.Assert(seen, DeepEquals, []string{"src", "src/a.go", "vendor", "vendor/tracked.go"})
+	c.Assert(fs.reads["build"], Equals, 0, Commentf("an ignored untracked directory must not be listed"))
+	c.Assert(fs.reads["build/deep"], Equals, 0)
+}
