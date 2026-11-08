@@ -1,8 +1,10 @@
 package object
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
+	"testing"
 
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/filemode"
@@ -268,6 +270,92 @@ func (s *RenameSuite) TestRenameLimit(c *C) {
 	result := detectRenames(c, changes, &DiffTreeOptions{RenameLimit: 1}, 4)
 	for i, res := range result {
 		c.Assert(res, DeepEquals, changes[i])
+	}
+}
+
+// similarPairs returns n delete/add pairs whose members share most lines (a
+// content rename) but are not byte-identical.
+func similarPairs(c *C, nAdds, nDeletes int) Changes {
+	var changes Changes
+	body := func(i int) string {
+		return fmt.Sprintf("line a %d\nline b %d\nline c %d\nline d %d\nshared tail\n", i, i, i, i)
+	}
+	for i := 0; i < nDeletes; i++ {
+		changes = append(changes, makeDelete(c, makeFile(c, fmt.Sprintf("old/f%d.txt", i), filemode.Regular, body(i))))
+	}
+	for i := 0; i < nAdds; i++ {
+		changes = append(changes, makeAdd(c, makeFile(c, fmt.Sprintf("new/g%d.txt", i), filemode.Regular, body(i)+"edited\n")))
+	}
+	return changes
+}
+
+// The rename limit follows git's too_many_rename_candidates: inexact detection
+// runs while (dst <= limit || src <= limit) && dst*src <= limit*limit.
+func (s *RenameSuite) TestRenameLimitFollowsGitProductRule(c *C) {
+	for _, tc := range []struct {
+		name       string
+		adds, dels int
+		limit      uint
+		detected   bool
+	}{
+		{"one add many deletes stays under product", 1, 5, 3, true},
+		{"product at limit squared", 3, 3, 3, true},
+		{"product above limit squared, one side within limit", 2, 5, 3, false},
+		{"both sides above limit", 4, 4, 3, false},
+		{"no limit", 4, 4, 0, true},
+	} {
+		changes := similarPairs(c, tc.adds, tc.dels)
+		result, err := DetectRenames(changes, &DiffTreeOptions{RenameScore: 60, RenameLimit: tc.limit})
+		c.Assert(err, IsNil, Commentf(tc.name))
+		renames := 0
+		for _, ch := range result {
+			if ch.From.Name != "" && ch.To.Name != "" {
+				renames++
+			}
+		}
+		if tc.detected {
+			c.Assert(renames, Equals, min(tc.adds, tc.dels), Commentf(tc.name))
+		} else {
+			c.Assert(renames, Equals, 0, Commentf(tc.name))
+		}
+	}
+}
+
+// Exact (identical-hash) renames are paired before the limit applies.
+func (s *RenameSuite) TestRenameLimitStillDetectsExactRenames(c *C) {
+	var changes Changes
+	for i := 0; i < 10; i++ {
+		content := fmt.Sprintf("content %d\n", i)
+		changes = append(changes,
+			makeDelete(c, makeFile(c, fmt.Sprintf("old/f%d.txt", i), filemode.Regular, content)),
+			makeAdd(c, makeFile(c, fmt.Sprintf("new/g%d.txt", i), filemode.Regular, content)))
+	}
+	result, err := DetectRenames(changes, &DiffTreeOptions{RenameScore: 60, RenameLimit: 1})
+	c.Assert(err, IsNil)
+	c.Assert(result, HasLen, 10)
+	for _, ch := range result {
+		c.Assert(ch.From.Name, Not(Equals), "")
+		c.Assert(ch.To.Name, Not(Equals), "")
+	}
+}
+
+func TestTooManyRenameCandidates(t *testing.T) {
+	for _, tc := range []struct {
+		dst, src, limit int
+		want            bool
+	}{
+		{1, 5000, 1000, false},
+		{5000, 1, 1000, false},
+		{1000, 1000, 1000, false},
+		{1100, 1100, 1000, true},
+		{1001, 1001, 1000, true},
+		{500, 2001, 1000, true},
+		{2, 3, 1, true},
+		{100, 100, 0, false},
+	} {
+		if got := tooManyRenameCandidates(tc.dst, tc.src, tc.limit); got != tc.want {
+			t.Errorf("tooManyRenameCandidates(%d, %d, %d) = %v, want %v", tc.dst, tc.src, tc.limit, got, tc.want)
+		}
 	}
 }
 

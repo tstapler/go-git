@@ -206,8 +206,7 @@ func (d *renameDetector) detectExactRenames() {
 // and matching by the highest score.
 // see: https://github.com/eclipse/jgit/blob/master/org.eclipse.jgit/src/org/eclipse/jgit/diff/SimilarityRenameDetector.java
 func (d *renameDetector) detectContentRenames() error {
-	cnt := max(len(d.added), len(d.deleted))
-	if d.renameLimit > 0 && cnt > d.renameLimit {
+	if tooManyRenameCandidates(len(d.added), len(d.deleted), d.renameLimit) {
 		return nil
 	}
 
@@ -242,6 +241,26 @@ func (d *renameDetector) detectContentRenames() error {
 	d.deleted = compactChanges(srcs)
 
 	return nil
+}
+
+// tooManyRenameCandidates reports whether inexact (content-similarity) rename
+// detection must be skipped for numDst remaining added files and numSrc
+// remaining deleted files. It mirrors git's too_many_rename_candidates() in
+// diffcore-rename.c for the non-copy case: detection runs only while
+// (numDst <= limit || numSrc <= limit) && numDst*numSrc <= limit*limit, so
+// 1 added x 5000 deleted still runs under the default limit of 1000, while
+// 1100 x 1100 does not. The counts are those left after exact renames were
+// paired off, so exact renames are always detected. A limit of 0 means no
+// limit (git's own 0 or negative maps to 32767; pass that to match exactly).
+//
+// Not mirrored: git's basename-guess pre-pass (diffcore-rename.c
+// find_basename_matches), which can pair files by basename before this check.
+func tooManyRenameCandidates(numDst, numSrc, limit int) bool {
+	if limit <= 0 {
+		return false
+	}
+	dst, src, l := uint64(numDst), uint64(numSrc), uint64(limit)
+	return (dst > l && src > l) || dst*src > l*l
 }
 
 func (d *renameDetector) detect() (Changes, error) {
