@@ -4,8 +4,6 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
-
-	"github.com/go-git/go-git/v5/plumbing"
 )
 
 // defaultMaxIdlePackHandles bounds the open packfile handles kept idle between reads when
@@ -17,22 +15,23 @@ const defaultMaxIdlePackHandles = 32
 // seek state, so it is never shared between concurrent reads) and returned afterwards; handles
 // beyond the idle limit are closed immediately, so open descriptors never exceed the limit plus
 // the reads in flight. Close releases every idle handle.
-type packHandlePool[T io.Closer] struct {
+type packHandlePool[K comparable, T io.Closer] struct {
 	mu      sync.Mutex
-	idle    map[plumbing.Hash][]T
-	order   []plumbing.Hash // packs with idle handles, least recently returned first
+	idle    map[K][]T
+	order   []K // packs with idle handles, least recently returned first
 	nIdle   int
+	shut    bool // after Close, returned handles are closed instead of kept
 	max     int
 	open    atomic.Int64
 	onCount func(open int64)
 }
 
-func newPackHandlePool[T io.Closer](max int, onCount func(open int64)) *packHandlePool[T] {
-	return &packHandlePool[T]{idle: make(map[plumbing.Hash][]T), max: max, onCount: onCount}
+func newPackHandlePool[K comparable, T io.Closer](max int, onCount func(open int64)) *packHandlePool[K, T] {
+	return &packHandlePool[K, T]{idle: make(map[K][]T), max: max, onCount: onCount}
 }
 
 // get returns an idle handle for pack, or nil when none is idle.
-func (p *packHandlePool[T]) get(pack plumbing.Hash) (h T, ok bool) {
+func (p *packHandlePool[K, T]) get(pack K) (h T, ok bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	list := p.idle[pack]
@@ -49,7 +48,7 @@ func (p *packHandlePool[T]) get(pack plumbing.Hash) (h T, ok bool) {
 	return h, true
 }
 
-func (p *packHandlePool[T]) dropFromOrder(pack plumbing.Hash) {
+func (p *packHandlePool[K, T]) dropFromOrder(pack K) {
 	for i, h := range p.order {
 		if h == pack {
 			p.order = append(p.order[:i], p.order[i+1:]...)
@@ -59,10 +58,10 @@ func (p *packHandlePool[T]) dropFromOrder(pack plumbing.Hash) {
 }
 
 // opened and closed track the open-handle gauge.
-func (p *packHandlePool[T]) opened() { p.report(p.open.Add(1)) }
-func (p *packHandlePool[T]) closed() { p.report(p.open.Add(-1)) }
+func (p *packHandlePool[K, T]) opened() { p.report(p.open.Add(1)) }
+func (p *packHandlePool[K, T]) closed() { p.report(p.open.Add(-1)) }
 
-func (p *packHandlePool[T]) report(n int64) {
+func (p *packHandlePool[K, T]) report(n int64) {
 	if p.onCount != nil {
 		p.onCount(n)
 	}
@@ -71,10 +70,15 @@ func (p *packHandlePool[T]) report(n int64) {
 // put returns h to the pool. When the pool is full it makes room by closing an idle handle of the
 // least recently used pack (a repository can have many packs; a per-pack-only cache would starve
 // all but the first few), and closes h itself only when it is the only candidate.
-func (p *packHandlePool[T]) put(pack plumbing.Hash, h T) error {
+func (p *packHandlePool[K, T]) put(pack K, h T) error {
 	var evict T
 	var evicting bool
 	p.mu.Lock()
+	if p.shut {
+		p.mu.Unlock()
+		p.closed()
+		return h.Close()
+	}
 	if p.nIdle >= p.max {
 		victimPack, ok := p.lruOther(pack)
 		if !ok {
@@ -105,20 +109,20 @@ func (p *packHandlePool[T]) put(pack plumbing.Hash, h T) error {
 }
 
 // lruOther returns the least recently used pack with idle handles other than pack.
-func (p *packHandlePool[T]) lruOther(pack plumbing.Hash) (plumbing.Hash, bool) {
+func (p *packHandlePool[K, T]) lruOther(pack K) (k K, ok bool) {
 	for _, h := range p.order {
 		if h != pack {
 			return h, true
 		}
 	}
-	return plumbing.ZeroHash, false
+	return k, false
 }
 
 // closeAll closes every idle handle (the pack set changed, or the storage is closing).
-func (p *packHandlePool[T]) closeAll() error {
+func (p *packHandlePool[K, T]) closeAll() error {
 	p.mu.Lock()
 	idle := p.idle
-	p.idle = make(map[plumbing.Hash][]T)
+	p.idle = make(map[K][]T)
 	p.order = nil
 	p.nIdle = 0
 	p.mu.Unlock()
@@ -133,4 +137,12 @@ func (p *packHandlePool[T]) closeAll() error {
 		}
 	}
 	return first
+}
+
+// shutdown closes every idle handle and makes later returns close theirs.
+func (p *packHandlePool[K, T]) shutdown() error {
+	p.mu.Lock()
+	p.shut = true
+	p.mu.Unlock()
+	return p.closeAll()
 }

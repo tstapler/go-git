@@ -39,6 +39,16 @@ type Options struct {
 	// value disables the pool and reopens the pack for every read. Handles are closed by Close
 	// (or by the garbage collector if the storage is dropped without Close).
 	MaxIdlePackHandles int
+	// MaxMappedPackBytes enables memory-mapped pack reads (Unix only) and caps the total mapped
+	// size; 0 or negative leaves it off and reads packs with ReadAt. It is opt-in because it did not
+	// pay off everywhere: on macOS reading all blobs and patch statistics used about 13-20% less CPU
+	// but a tree diff used 2.5x more (page faults on scattered small reads); see bench/README.md.
+	// Packs that cannot be mapped (not an OS file, over the cap) fall back to ReadAt. Pack files
+	// deleted by gc or repack stay mapped until their last reader closes or Reindex or Close runs.
+	MaxMappedPackBytes int64
+	// OnMappedPackBytes, when set, is called with the mapped byte total and mapping count whenever
+	// they change, for metrics.
+	OnMappedPackBytes func(bytes int64, count int)
 	// OnOpenPackHandles, when set, is called with the number of open pooled pack handles each time
 	// it changes, for metrics. It must be fast and must not call back into the storage.
 	OnOpenPackHandles func(open int64)

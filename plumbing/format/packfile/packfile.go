@@ -43,7 +43,19 @@ type Packfile struct {
 	deltaBaseCache       cache.Object
 	offsetToType         map[int64]plumbing.ObjectType
 	largeObjectThreshold int64
+	src                  HandleSource
 }
+
+// HandleSource lends open handles to a pack file so lazily read objects (FSObject) can reuse them
+// instead of opening the file for every Reader call. Borrow returns a handle for exclusive use;
+// Return gives it back (the source may close it).
+type HandleSource interface {
+	Borrow(path string) (billy.File, error)
+	Return(path string, f billy.File) error
+}
+
+// SetHandleSource makes FSObjects created by this packfile borrow handles from src.
+func (p *Packfile) SetHandleSource(src HandleSource) { p.src = src }
 
 // NewPackfileWithCache creates a new Packfile with the given object cache.
 // If the filesystem is provided, the packfile will return FSObjects, otherwise
@@ -57,13 +69,13 @@ func NewPackfileWithCache(
 ) *Packfile {
 	s := NewScanner(file)
 	return &Packfile{
-		index,
-		fs,
-		file,
-		s,
-		cache,
-		make(map[int64]plumbing.ObjectType),
-		largeObjectThreshold,
+		Index:                index,
+		fs:                   fs,
+		file:                 file,
+		s:                    s,
+		deltaBaseCache:       cache,
+		offsetToType:         make(map[int64]plumbing.ObjectType),
+		largeObjectThreshold: largeObjectThreshold,
 	}
 }
 
@@ -277,7 +289,7 @@ func (p *Packfile) getNextObject(h *ObjectHeader, hash plumbing.Hash) (plumbing.
 		p.file.Name(),
 		p.deltaBaseCache,
 		p.largeObjectThreshold,
-	), nil
+	).withHandleSource(p.src), nil
 }
 
 func (p *Packfile) getObjectContent(offset int64) (io.ReadCloser, error) {

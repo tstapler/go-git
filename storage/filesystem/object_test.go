@@ -680,7 +680,7 @@ func (f fakeHandle) Close() error { *f.closed++; return nil }
 
 func (s *FsSuite) TestPackHandlePoolEvictsLeastRecentlyUsedPack(c *C) {
 	closed := 0
-	p := newPackHandlePool[fakeHandle](2, nil)
+	p := newPackHandlePool[plumbing.Hash, fakeHandle](2, nil)
 	a, b, d := plumbing.Hash{1}, plumbing.Hash{2}, plumbing.Hash{3}
 	for _, h := range []plumbing.Hash{a, b} {
 		p.opened()
@@ -699,7 +699,7 @@ func (s *FsSuite) TestPackHandlePoolEvictsLeastRecentlyUsedPack(c *C) {
 	c.Assert(p.open.Load(), Equals, int64(2))
 
 	// Same pack returned twice over the bound: only itself can be closed.
-	p = newPackHandlePool[fakeHandle](1, nil)
+	p = newPackHandlePool[plumbing.Hash, fakeHandle](1, nil)
 	closed = 0
 	p.opened()
 	p.opened()

@@ -21,6 +21,28 @@ type FSObject struct {
 	path                 string
 	cache                cache.Object
 	largeObjectThreshold int64
+	src                  HandleSource
+}
+
+func (o *FSObject) withHandleSource(src HandleSource) *FSObject {
+	o.src = src
+	return o
+}
+
+// open returns a handle for the object's pack and a function that releases it.
+func (o *FSObject) open() (billy.File, func() error, error) {
+	if o.src != nil {
+		f, err := o.src.Borrow(o.path)
+		if err != nil {
+			return nil, nil, err
+		}
+		return f, func() error { return o.src.Return(o.path, f) }, nil
+	}
+	f, err := o.fs.Open(o.path)
+	if err != nil {
+		return nil, nil, err
+	}
+	return f, f.Close, nil
 }
 
 // NewFSObject creates a new filesystem object.
@@ -60,7 +82,7 @@ func (o *FSObject) Reader() (io.ReadCloser, error) {
 		return reader, nil
 	}
 
-	f, err := o.fs.Open(o.path)
+	f, release, err := o.open()
 	if err != nil {
 		return nil, err
 	}
@@ -75,7 +97,7 @@ func (o *FSObject) Reader() (io.ReadCloser, error) {
 
 		r, err := p.getReaderDirect(h)
 		if err != nil {
-			_ = f.Close()
+			_ = release()
 			return nil, err
 		}
 		// Cap the lazy stream at the resolved object size: well-formed
@@ -84,15 +106,15 @@ func (o *FSObject) Reader() (io.ReadCloser, error) {
 		// past the limit. For delta-resolved objects o.size is the
 		// expanded size, which is what the caller is reading here.
 		bounded := newBoundedReadCloser(r, o.size)
-		return ioutil.NewReadCloserWithCloser(bounded, f.Close), nil
+		return ioutil.NewReadCloserWithCloser(bounded, release), nil
 	}
 	r, err := p.getObjectContent(o.offset)
 	if err != nil {
-		_ = f.Close()
+		_ = release()
 		return nil, err
 	}
 
-	if err := f.Close(); err != nil {
+	if err := release(); err != nil {
 		return nil, err
 	}
 
