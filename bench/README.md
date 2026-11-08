@@ -28,3 +28,6 @@ Caveats when reading the results:
 - libgit2 and git keep an object cache; go-git does too (`cache.Object`), but repositories of many
   identical blobs reward whichever tool caches best.
 - Numbers are from one machine and one run; use them for ratios, not absolutes.
+
+`ggbench` also prints `cpu=<ms>` (user plus system CPU of the best run). Use it, not wall time, when the machine is
+loaded: wall times of the same binary varied 2x to 5x during the measurements in the fork's PRs, CPU time by about 10%.

@@ -15,6 +15,7 @@ import (
 	"os"
 	"runtime/pprof"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/go-git/go-billy/v5/osfs"
@@ -25,17 +26,22 @@ import (
 	"github.com/go-git/go-git/v5/storage/filesystem"
 )
 
-func best(f func() int) (time.Duration, int) {
-	var d time.Duration
-	var n int
+// cpuTime is the process's user plus system CPU time; unlike wall time it stays comparable on a loaded machine.
+func cpuTime() time.Duration {
+	var ru syscall.Rusage
+	_ = syscall.Getrusage(syscall.RUSAGE_SELF, &ru)
+	return time.Duration(ru.Utime.Nano() + ru.Stime.Nano())
+}
+
+func best(f func() int) (wall, cpu time.Duration, n int) {
 	for i := 0; i < 3; i++ {
-		s := time.Now()
+		s, c := time.Now(), cpuTime()
 		n = f()
-		if e := time.Since(s); i == 0 || e < d {
-			d = e
+		if e, ce := time.Since(s), cpuTime()-c; i == 0 || e < wall {
+			wall, cpu = e, ce
 		}
 	}
-	return d, n
+	return wall, cpu, n
 }
 
 // openRepo opens with go-git's defaults, or with KeepDescriptors when GGBENCH_KEEPFD=1: by default
@@ -76,8 +82,8 @@ func main() {
 		if only != "" && only != op {
 			return
 		}
-		d, n := best(f)
-		fmt.Printf("%s\t%.1f\t%d\n", op, float64(d.Microseconds())/1000, n)
+		d, cpu, n := best(f)
+		fmt.Printf("%s\t%.1f\t%d\tcpu=%.1f\n", op, float64(d.Microseconds())/1000, n, float64(cpu.Microseconds())/1000)
 	}
 	opts := &object.DiffTreeOptions{DetectRenames: true, RenameScore: 50, RenameLimit: object.DefaultRenameLimit}
 

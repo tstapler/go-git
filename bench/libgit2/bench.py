@@ -102,7 +102,7 @@ def l2_ops(repo, base, head):
 def go_ops(ggbench, repo, base, head, keepfd=False):
     env = dict(ENV, GGBENCH_KEEPFD="1" if keepfd else "0")
     out = subprocess.run([ggbench, repo, base, head], env=env, check=True, capture_output=True, text=True).stdout
-    return {l.split("\t")[0]: (float(l.split("\t")[1]), int(l.split("\t")[2])) for l in out.splitlines()}
+    return {l.split("\t")[0]: (float(l.split("\t")[1]), int(l.split("\t")[2])) for l in out.splitlines()}  # a 4th cpu=<ms> column is for manual comparison
 
 def report(title, repo, base, head, ggbench):
     spawn, _ = timed(lambda: git(repo, "--version"))
