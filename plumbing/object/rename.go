@@ -59,6 +59,10 @@ type renameDetector struct {
 	renameScore int
 	renameLimit int
 	onlyExact   bool
+
+	// indexCacheBudget bounds cached source similarity indexes in bytes: 0 selects
+	// maxCachedIndexBytes, a negative value disables the cache. Results never depend on it.
+	indexCacheBudget int
 }
 
 // detectExactRenames pairs deleted and added files with identical content and a
@@ -146,7 +150,7 @@ func (d *renameDetector) detectBasenameRenames() error {
 		if err != nil {
 			return err
 		}
-		if !ok || score < d.renameScore*100 {
+		if !ok || score < minBasenameScore(d.renameScore) {
 			continue
 		}
 		usedSrc[srcIdx] = struct{}{}
@@ -181,6 +185,13 @@ func uniqueBasenames(changes []*Change) map[string]int {
 		}
 	}
 	return m
+}
+
+// minBasenameScore is git's min_basename_score: the basename pre-pass demands the minimum score plus
+// half the gap to a perfect score (GIT_BASENAME_FACTOR 0.5), e.g. -M50 needs 75%.
+func minBasenameScore(renameScore int) int {
+	min := renameScore * 100
+	return min + (10000-min)/2
 }
 
 // pairSimilarity scores one source/destination pair on the 0..10000 scale. ok is false when
@@ -221,52 +232,169 @@ func pairSimilarity(src, dst *Change, renameScore int) (score int, ok bool, err 
 	return si.score(di, 10000), true, nil
 }
 
-// detectContentRenames detects renames based on the similarity of the content
-// in the files by building a matrix of pairs between sources and destinations
-// and matching by the highest score.
-// see: https://github.com/eclipse/jgit/blob/master/org.eclipse.jgit/src/org/eclipse/jgit/diff/SimilarityRenameDetector.java
+// detectContentRenames pairs the remaining files by content similarity, emulating git's
+// inexact phase (diffcore-rename.c): for each destination in path order a 4-slot array
+// (NUM_CANDIDATE_PER_DST) is filled by record_if_better over every source, with sources that
+// cannot match (symlinks, too different in size) counting as score 0 so they still occupy
+// slots; the destination-major array is then stable-sorted by score_compare and paired in
+// order. Each file's similarity index is built once: a destination's for the duration of its
+// row, a source's through a bounded cache.
 func (d *renameDetector) detectContentRenames() error {
 	if tooManyRenameCandidates(len(d.added), len(d.deleted), d.renameLimit) {
 		return nil
 	}
-
 	srcs, dsts := d.deleted, d.added
-	matrix, err := buildSimilarityMatrix(srcs, dsts, d.renameScore)
-	if err != nil {
-		return err
+	budget := d.indexCacheBudget
+	if budget == 0 {
+		budget = maxCachedIndexBytes
 	}
-	renames := make([]*Change, 0, min(len(matrix), len(dsts)))
+	srcIndexes := newSimilarityIndexCache(max(budget, 0))
+	srcFiles := make([]*File, len(srcs))
+	minScore := d.renameScore * 100
 
-	// Match rename pairs best first until everything above the minimum score has been
-	// looked at. Like git, only each destination's best numCandidatesPerDst sources are
-	// candidates (NUM_CANDIDATE_PER_DST in diffcore-rename.c).
-	seen := make(map[int]int)
-	for i := len(matrix) - 1; i >= 0; i-- {
-		pair := matrix[i]
-		seen[pair.added]++
-		if seen[pair.added] > numCandidatesPerDst {
+	mx := make([]renameCandidate, 0, len(dsts)*numCandidatesPerDst)
+	for dstIdx, dst := range dsts {
+		slots := [numCandidatesPerDst]renameCandidate{}
+		for k := range slots {
+			slots[k].dst = -1
+		}
+		row := dstRow{dst: dst}
+		for srcIdx, src := range srcs {
+			score, err := row.score(srcIdx, src, srcFiles, srcIndexes, d.renameScore)
+			if err != nil {
+				return err
+			}
+			recordIfBetter(&slots, renameCandidate{dst: dstIdx, src: srcIdx, score: score, name: basenameSame(src, dst)})
+		}
+		mx = append(mx, slots[:]...)
+	}
+	sort.SliceStable(mx, func(i, j int) bool { return scoreCompare(mx[i], mx[j]) < 0 })
+
+	usedSrc := make(map[int]struct{})
+	usedDst := make(map[int]struct{})
+	for _, c := range mx {
+		if c.dst < 0 || c.score < minScore {
+			break
+		}
+		if _, ok := usedDst[c.dst]; ok {
 			continue
 		}
-		src := srcs[pair.deleted]
-		dst := dsts[pair.added]
-
-		if dst == nil || src == nil {
-			// It was already matched before
+		if _, ok := usedSrc[c.src]; ok {
 			continue
 		}
-
-		renames = append(renames, &Change{From: src.From, To: dst.To})
-
-		// Claim destination and source as matched
-		dsts[pair.added] = nil
-		srcs[pair.deleted] = nil
+		usedDst[c.dst], usedSrc[c.src] = struct{}{}, struct{}{}
+		d.modified = append(d.modified, &Change{From: srcs[c.src].From, To: dsts[c.dst].To})
 	}
 
-	d.modified = append(d.modified, renames...)
-	d.added = compactChanges(dsts)
-	d.deleted = compactChanges(srcs)
-
+	var addedLeft, deletedLeft []*Change
+	for i, c := range dsts {
+		if _, ok := usedDst[i]; !ok {
+			addedLeft = append(addedLeft, c)
+		}
+	}
+	for i, c := range srcs {
+		if _, ok := usedSrc[i]; !ok {
+			deletedLeft = append(deletedLeft, c)
+		}
+	}
+	d.added, d.deleted = addedLeft, deletedLeft
 	return nil
+}
+
+// numCandidatesPerDst is git's NUM_CANDIDATE_PER_DST.
+const numCandidatesPerDst = 4
+
+// renameCandidate is git's struct diff_score; dst < 0 marks an unused slot.
+type renameCandidate struct {
+	dst, src int
+	score    int // content similarity, 0..10000
+	name     int // basename_same, git's name_score
+}
+
+// scoreCompare is git's score_compare: unused slots sink, then higher score, then higher name score first.
+func scoreCompare(a, b renameCandidate) int {
+	if a.dst < 0 {
+		if b.dst >= 0 {
+			return 1
+		}
+		return 0
+	} else if b.dst < 0 {
+		return -1
+	}
+	if a.score == b.score {
+		return b.name - a.name
+	}
+	return b.score - a.score
+}
+
+// recordIfBetter is git's record_if_better: replace the worst slot when o beats it.
+func recordIfBetter(slots *[numCandidatesPerDst]renameCandidate, o renameCandidate) {
+	worst := 0
+	for i := 1; i < numCandidatesPerDst; i++ {
+		if scoreCompare(slots[i], slots[worst]) > 0 {
+			worst = i
+		}
+	}
+	if scoreCompare(slots[worst], o) > 0 {
+		slots[worst] = o
+	}
+}
+
+// dstRow scores one destination against many sources, building the destination's similarity
+// index at most once.
+type dstRow struct {
+	dst     *Change
+	file    *File
+	index   *similarityIndex
+	tooBig  bool
+	indexed bool
+}
+
+// score returns 0 when the pair cannot be a content rename (not two regular files, sizes too
+// different, or a file too large to index), like git's estimate_similarity returning 0.
+func (r *dstRow) score(srcIdx int, src *Change, srcFiles []*File, srcIndexes *similarityIndexCache, renameScore int) (int, error) {
+	if !isRegularFile(changeMode(src)) || !isRegularFile(changeMode(r.dst)) {
+		return 0, nil
+	}
+	var err error
+	from := srcFiles[srcIdx]
+	if from == nil {
+		if from, _, err = src.Files(); err != nil {
+			return 0, err
+		}
+		srcFiles[srcIdx] = from
+	}
+	if r.file == nil {
+		if _, r.file, err = r.dst.Files(); err != nil {
+			return 0, err
+		}
+	}
+	srcSize, dstSize := from.Size+1, r.file.Size+1
+	lo, hi := srcSize, dstSize
+	if dstSize < srcSize {
+		lo, hi = dstSize, srcSize
+	}
+	if int(lo*100/hi) < renameScore {
+		return 0, nil
+	}
+	si, err := srcIndexes.get(srcIdx, func() (*File, error) { return from, nil })
+	if err == errIndexFull {
+		return 0, nil
+	} else if err != nil {
+		return 0, err
+	}
+	if !r.indexed {
+		r.indexed = true
+		if r.index, err = fileSimilarityIndex(r.file); err == errIndexFull {
+			r.tooBig = true
+		} else if err != nil {
+			return 0, err
+		}
+	}
+	if r.tooBig {
+		return 0, nil
+	}
+	return si.score(r.index, 10000), nil
 }
 
 // tooManyRenameCandidates reports whether inexact (content-similarity) rename
@@ -275,12 +403,10 @@ func (d *renameDetector) detectContentRenames() error {
 // diffcore-rename.c for the non-copy case: detection runs only while
 // (numDst <= limit || numSrc <= limit) && numDst*numSrc <= limit*limit, so
 // 1 added x 5000 deleted still runs under the default limit of 1000, while
-// 1100 x 1100 does not. The counts are those left after exact renames were
-// paired off, so exact renames are always detected. A limit of 0 means no
-// limit (git's own 0 or negative maps to 32767; pass that to match exactly).
-//
-// Not mirrored: git's basename-guess pre-pass (diffcore-rename.c
-// find_basename_matches), which can pair files by basename before this check.
+// 1100 x 1100 does not. The counts are those left after the exact pass and the
+// basename pre-pass (find_basename_matches) paired files off, so those pairs are
+// always detected. A limit of 0 means no limit (git's own 0 or negative maps to
+// 32767; pass that to match exactly).
 func tooManyRenameCandidates(numDst, numSrc, limit int) bool {
 	if limit <= 0 {
 		return false
@@ -311,71 +437,6 @@ func (d *renameDetector) detect() (Changes, error) {
 	sort.Stable(result)
 
 	return result, nil
-}
-
-func bestNameMatch(change *Change, changes []*Change) *Change {
-	var best *Change
-	var bestScore int
-
-	cname := changeName(change)
-
-	for _, c := range changes {
-		score := nameSimilarityScore(cname, changeName(c))
-		if score > bestScore {
-			bestScore = score
-			best = c
-		}
-	}
-
-	return best
-}
-
-func nameSimilarityScore(a, b string) int {
-	aDirLen := strings.LastIndexByte(a, '/') + 1
-	bDirLen := strings.LastIndexByte(b, '/') + 1
-
-	dirMin := min(aDirLen, bDirLen)
-	dirMax := max(aDirLen, bDirLen)
-
-	var dirScoreLtr, dirScoreRtl int
-	if dirMax == 0 {
-		dirScoreLtr = 100
-		dirScoreRtl = 100
-	} else {
-		var dirSim int
-
-		for ; dirSim < dirMin; dirSim++ {
-			if a[dirSim] != b[dirSim] {
-				break
-			}
-		}
-
-		dirScoreLtr = dirSim * 100 / dirMax
-
-		if dirScoreLtr == 100 {
-			dirScoreRtl = 100
-		} else {
-			for dirSim = 0; dirSim < dirMin; dirSim++ {
-				if a[aDirLen-1-dirSim] != b[bDirLen-1-dirSim] {
-					break
-				}
-			}
-			dirScoreRtl = dirSim * 100 / dirMax
-		}
-	}
-
-	fileMin := min(len(a)-aDirLen, len(b)-bDirLen)
-	fileMax := max(len(a)-aDirLen, len(b)-bDirLen)
-
-	fileSim := 0
-	for ; fileSim < fileMin; fileSim++ {
-		if a[len(a)-1-fileSim] != b[len(b)-1-fileSim] {
-			break
-		}
-	}
-	fileScore := fileSim * 100 / fileMax
-
-	return (((dirScoreLtr + dirScoreRtl) * 25) + (fileScore * 50)) / 100
 }
 
 func changeName(c *Change) string {
@@ -423,40 +484,6 @@ func groupChangesByHash(changes []*Change) map[plumbing.Hash][]*Change {
 	return result
 }
 
-// numCandidatesPerDst is git's NUM_CANDIDATE_PER_DST.
-const numCandidatesPerDst = 4
-
-type similarityMatrix []similarityPair
-
-func (m similarityMatrix) Len() int      { return len(m) }
-func (m similarityMatrix) Swap(i, j int) { m[i], m[j] = m[j], m[i] }
-
-// Less orders by score, then by basename match (git's name_score), then prefers lower
-// indices, so iterating from the end picks the first path in sorted order on a tie.
-func (m similarityMatrix) Less(i, j int) bool {
-	if m[i].score != m[j].score {
-		return m[i].score < m[j].score
-	}
-	if m[i].name != m[j].name {
-		return m[i].name < m[j].name
-	}
-	if m[i].added != m[j].added {
-		return m[i].added > m[j].added
-	}
-	return m[i].deleted > m[j].deleted
-}
-
-type similarityPair struct {
-	// index of the added file
-	added int
-	// index of the deleted file
-	deleted int
-	// similarity score
-	score int
-	// 1 when both files have the same basename (git's name_score)
-	name int
-}
-
 func max(a, b int) int {
 	if a > b {
 		return a
@@ -471,15 +498,13 @@ func min(a, b int) int {
 	return b
 }
 
-const maxMatrixSize = 10000
-
-// maxCachedIndexBytes bounds the memory held by cached destination similarity
+// maxCachedIndexBytes bounds the memory held by cached source similarity
 // indexes (each is at most 1MiB). Past it, an index is rebuilt per use, which
 // is the pre-cache behaviour, so results never depend on the budget.
 const maxCachedIndexBytes = 128 << 20
 
-// similarityIndexCache builds each destination's similarity index once and
-// reuses it for every source, like git's diffcore-rename.c, which computes a
+// similarityIndexCache builds each source's similarity index once and
+// reuses it for every destination, like git's diffcore-rename.c, which computes a
 // filespec's spanhash once (diff_filespec_populate / estimate_similarity via
 // cnt_data) and reuses it across all pairs.
 type similarityIndexCache struct {
@@ -492,7 +517,7 @@ func newSimilarityIndexCache(budget int) *similarityIndexCache {
 	return &similarityIndexCache{indexes: make(map[int]*similarityIndex), budget: budget}
 }
 
-// get returns the index for dst number idx, building it from file() when absent.
+// get returns the index for entry idx, building it from file() when absent.
 func (c *similarityIndexCache) get(idx int, file func() (*File, error)) (*similarityIndex, error) {
 	if di, ok := c.indexes[idx]; ok {
 		return di, nil
@@ -510,134 +535,6 @@ func (c *similarityIndexCache) get(idx int, file func() (*File, error)) (*simila
 		c.bytes += size
 	}
 	return di, nil
-}
-
-func buildSimilarityMatrix(srcs, dsts []*Change, renameScore int) (similarityMatrix, error) {
-	return buildSimilarityMatrixWithBudget(srcs, dsts, renameScore, maxCachedIndexBytes)
-}
-
-// buildSimilarityMatrixWithBudget is buildSimilarityMatrix with an explicit
-// destination-index cache budget in bytes; the result never depends on it.
-func buildSimilarityMatrixWithBudget(srcs, dsts []*Change, renameScore, cacheBudget int) (similarityMatrix, error) {
-	dstIndexes := newSimilarityIndexCache(cacheBudget)
-	// Allocate for the worst-case scenario where every pair has a score
-	// that we need to consider. We might not need that many.
-	matrixSize := len(srcs) * len(dsts)
-	if matrixSize > maxMatrixSize {
-		matrixSize = maxMatrixSize
-	}
-	matrix := make(similarityMatrix, 0, matrixSize)
-	srcSizes := make([]int64, len(srcs))
-	dstSizes := make([]int64, len(dsts))
-	dstTooLarge := make(map[int]bool)
-
-	// Consider each pair of files, if the score is above the minimum
-	// threshold we need to record that scoring in the matrix so we can
-	// later find the best matches.
-outerLoop:
-	for srcIdx, src := range srcs {
-		if !isRegularFile(changeMode(src)) {
-			continue
-		}
-
-		// Declare the from file and the similarity index here to be able to
-		// reuse it inside the inner loop. The reason to not initialize them
-		// here is so we can skip the initialization in case they happen to
-		// not be needed later. They will be initialized inside the inner
-		// loop if and only if they're needed and reused in subsequent passes.
-		var from *File
-		var s *similarityIndex
-		var err error
-		for dstIdx, dst := range dsts {
-			if !isRegularFile(changeMode(dst)) {
-				continue
-			}
-
-			if dstTooLarge[dstIdx] {
-				continue
-			}
-
-			var to *File
-			srcSize := srcSizes[srcIdx]
-			if srcSize == 0 {
-				from, _, err = src.Files()
-				if err != nil {
-					return nil, err
-				}
-				srcSize = from.Size + 1
-				srcSizes[srcIdx] = srcSize
-			}
-
-			dstSize := dstSizes[dstIdx]
-			if dstSize == 0 {
-				_, to, err = dst.Files()
-				if err != nil {
-					return nil, err
-				}
-				dstSize = to.Size + 1
-				dstSizes[dstIdx] = dstSize
-			}
-
-			min, max := srcSize, dstSize
-			if dstSize < srcSize {
-				min = dstSize
-				max = srcSize
-			}
-
-			if int(min*100/max) < renameScore {
-				// File sizes are too different to be a match
-				continue
-			}
-
-			if s == nil {
-				s, err = fileSimilarityIndex(from)
-				if err != nil {
-					if err == errIndexFull {
-						continue outerLoop
-					}
-					return nil, err
-				}
-			}
-
-			di, err := dstIndexes.get(dstIdx, func() (*File, error) {
-				if to != nil {
-					return to, nil
-				}
-				_, f, err := dst.Files()
-				return f, err
-			})
-			if err != nil {
-				if err == errIndexFull {
-					dstTooLarge[dstIdx] = true
-				}
-
-				return nil, err
-			}
-
-			// Content similarity only, 0..10000, as git does; basename equality is a
-			// separate tie-break (name), not blended into the score.
-			score := s.score(di, 10000)
-			if score < renameScore*100 {
-				continue
-			}
-
-			matrix = append(matrix, similarityPair{added: dstIdx, deleted: srcIdx, score: score, name: basenameSame(src, dst)})
-		}
-	}
-
-	sort.Stable(matrix)
-
-	return matrix, nil
-}
-
-func compactChanges(changes []*Change) []*Change {
-	var result []*Change
-	for _, c := range changes {
-		if c != nil {
-			result = append(result, c)
-		}
-	}
-	return result
 }
 
 const (
