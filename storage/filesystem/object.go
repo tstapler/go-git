@@ -89,8 +89,9 @@ func (s *ObjectStorage) acquirePackfile(idx idxfile.Index, pack plumbing.Hash) (
 		return p, func() error { return nil }, nil
 	}
 
+	gen := s.pool.generation()
 	if p, ok := s.pool.get(pack); ok {
-		return p, func() error { return s.pool.put(pack, p) }, nil
+		return p, func() error { return s.pool.put(pack, gen, p) }, nil
 	}
 
 	f, err := s.dir.ObjectPack(pack)
@@ -104,7 +105,7 @@ func (s *ObjectStorage) acquirePackfile(idx idxfile.Index, pack plumbing.Hash) (
 		p = packfile.NewPackfile(idx, s.dir.Fs(), f, s.options.LargeObjectThreshold)
 	}
 	s.pool.opened()
-	return p, func() error { return s.pool.put(pack, p) }, nil
+	return p, func() error { return s.pool.put(pack, gen, p) }, nil
 }
 
 func (s *ObjectStorage) requireIndex() error {
@@ -974,5 +975,9 @@ func (s *ObjectStorage) ObjectPacks() ([]plumbing.Hash, error) {
 }
 
 func (s *ObjectStorage) DeleteOldObjectPackAndIndex(h plumbing.Hash, t time.Time) error {
+	if s.pool != nil {
+		// An idle handle would block deleting the pack on Windows and pin its space elsewhere.
+		_ = s.pool.closeAll()
+	}
 	return s.dir.DeleteOldObjectPackAndIndex(h, t)
 }

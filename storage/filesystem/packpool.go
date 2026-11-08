@@ -22,6 +22,7 @@ type packHandlePool[T io.Closer] struct {
 	idle    map[plumbing.Hash][]T
 	order   []plumbing.Hash // packs with idle handles, least recently returned first
 	nIdle   int
+	gen     uint64 // bumped by closeAll; handles borrowed before it are closed, not re-pooled
 	max     int
 	open    atomic.Int64
 	onCount func(open int64)
@@ -29,6 +30,13 @@ type packHandlePool[T io.Closer] struct {
 
 func newPackHandlePool[T io.Closer](max int, onCount func(open int64)) *packHandlePool[T] {
 	return &packHandlePool[T]{idle: make(map[plumbing.Hash][]T), max: max, onCount: onCount}
+}
+
+// generation returns the current pool generation; pass it to put for a handle opened or borrowed now.
+func (p *packHandlePool[T]) generation() uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.gen
 }
 
 // get returns an idle handle for pack, or nil when none is idle.
@@ -71,10 +79,15 @@ func (p *packHandlePool[T]) report(n int64) {
 // put returns h to the pool. When the pool is full it makes room by closing an idle handle of the
 // least recently used pack (a repository can have many packs; a per-pack-only cache would starve
 // all but the first few), and closes h itself only when it is the only candidate.
-func (p *packHandlePool[T]) put(pack plumbing.Hash, h T) error {
+func (p *packHandlePool[T]) put(pack plumbing.Hash, gen uint64, h T) error {
 	var evict T
 	var evicting bool
 	p.mu.Lock()
+	if gen != p.gen {
+		p.mu.Unlock()
+		p.closed()
+		return h.Close()
+	}
 	if p.nIdle >= p.max {
 		victimPack, ok := p.lruOther(pack)
 		if !ok {
@@ -121,6 +134,7 @@ func (p *packHandlePool[T]) closeAll() error {
 	p.idle = make(map[plumbing.Hash][]T)
 	p.order = nil
 	p.nIdle = 0
+	p.gen++
 	p.mu.Unlock()
 
 	var first error

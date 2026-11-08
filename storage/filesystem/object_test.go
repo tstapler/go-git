@@ -685,13 +685,13 @@ func (s *FsSuite) TestPackHandlePoolEvictsLeastRecentlyUsedPack(c *C) {
 	a, b, d := plumbing.Hash{1}, plumbing.Hash{2}, plumbing.Hash{3}
 	for _, h := range []plumbing.Hash{a, b} {
 		p.opened()
-		c.Assert(p.put(h, fakeHandle{&closed}), IsNil)
+		c.Assert(p.put(h, 0, fakeHandle{&closed}), IsNil)
 	}
 	c.Assert(closed, Equals, 0)
 
 	// A third pack evicts the least recently returned one (a), not itself.
 	p.opened()
-	c.Assert(p.put(d, fakeHandle{&closed}), IsNil)
+	c.Assert(p.put(d, 0, fakeHandle{&closed}), IsNil)
 	c.Assert(closed, Equals, 1)
 	_, hasA := p.get(a)
 	_, hasB := p.get(b)
@@ -704,12 +704,24 @@ func (s *FsSuite) TestPackHandlePoolEvictsLeastRecentlyUsedPack(c *C) {
 	closed = 0
 	p.opened()
 	p.opened()
-	c.Assert(p.put(a, fakeHandle{&closed}), IsNil)
-	c.Assert(p.put(a, fakeHandle{&closed}), IsNil)
+	c.Assert(p.put(a, 0, fakeHandle{&closed}), IsNil)
+	c.Assert(p.put(a, 0, fakeHandle{&closed}), IsNil)
 	c.Assert(closed, Equals, 1)
 	c.Assert(p.closeAll(), IsNil)
 	c.Assert(closed, Equals, 2)
 	c.Assert(p.open.Load(), Equals, int64(0))
+
+	// A handle borrowed before closeAll is closed on return, not re-pooled.
+	p = newPackHandlePool[fakeHandle](4, nil)
+	closed = 0
+	p.opened()
+	gen := p.generation()
+	c.Assert(p.closeAll(), IsNil)
+	c.Assert(p.put(a, gen, fakeHandle{&closed}), IsNil)
+	c.Assert(closed, Equals, 1)
+	c.Assert(p.open.Load(), Equals, int64(0))
+	_, ok := p.get(a)
+	c.Assert(ok, Equals, false)
 }
 
 func (s *FsSuite) TestPackHandlePoolConcurrentReadsStayBounded(c *C) {
