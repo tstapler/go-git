@@ -2,6 +2,7 @@
 //
 //	go run ./bench/ggbench <repo> <base-rev> <head-rev>
 //
+// GGBENCH_IDLE=<n> opens with that MaxIdlePackHandles.
 // GGBENCH_KEEPFD=1 opens with filesystem.Options{KeepDescriptors: true}.
 // GGBENCH_ONLY=<op> restricts it to one operation and GGBENCH_CPUPROFILE=<file> writes a CPU profile.
 // It prints one "op<TAB>milliseconds<TAB>result-count" line per operation (best of 3).
@@ -13,6 +14,7 @@ import (
 	"io"
 	"os"
 	"runtime/pprof"
+	"strconv"
 	"time"
 
 	"github.com/go-git/go-billy/v5/osfs"
@@ -39,11 +41,13 @@ func best(f func() int) (time.Duration, int) {
 // openRepo opens with go-git's defaults, or with KeepDescriptors when GGBENCH_KEEPFD=1: by default
 // every packed-object read reopens its packfile, which is what stapler-squad avoids with KeepDescriptors.
 func openRepo(path string) *git.Repository {
-	if os.Getenv("GGBENCH_KEEPFD") != "1" {
+	idle, _ := strconv.Atoi(os.Getenv("GGBENCH_IDLE"))
+	if os.Getenv("GGBENCH_KEEPFD") != "1" && idle == 0 {
 		return must(git.PlainOpen(path))
 	}
 	dot := osfs.New(path + "/.git")
-	st := filesystem.NewStorageWithOptions(dot, cache.NewObjectLRUDefault(), filesystem.Options{KeepDescriptors: true})
+	st := filesystem.NewStorageWithOptions(dot, cache.NewObjectLRUDefault(), filesystem.Options{
+		KeepDescriptors: os.Getenv("GGBENCH_KEEPFD") == "1", MaxIdlePackHandles: idle})
 	return must(git.Open(st, osfs.New(path)))
 }
 

@@ -55,6 +55,15 @@ This is a public fork of [go-git/go-git](https://github.com/go-git/go-git) used 
   twice); duplicate-content exact-rename groups cost O(1) per destination; and a loose-object cache hit costs a
   `stat` instead of an open and close (the stat keeps shared object caches correct across repositories).
   Results are unchanged (same oracle tests).
+- **Pack handle pool** (stacked change): without `KeepDescriptors`, idle packfile handles are kept in a bounded pool
+  (`filesystem.Options.MaxIdlePackHandles`, default 32, negative disables) instead of reopening the pack for every
+  packed-object read. Handles are borrowed exclusively (no shared seek state between concurrent reads), the least
+  recently returned pack is evicted when full, `Close` releases them, and `ObjectStorage.OpenPackHandles` /
+  `Options.OnOpenPackHandles` expose the open count. A storage dropped without `Close` releases them when the
+  garbage collector finalizes the files. On Windows the pool is off unless `MaxIdlePackHandles` is set, because an idle handle blocks deleting that pack file (repack, prune) until `Close`.
+  Measured on a 13k-file repository with 45 packs, default open: tree diff 184 to about 15-30 ms, log walk
+  172 to about 21-30 ms.
+- **gitignore**: `ReadPatterns` no longer descends into a directory ignored by an ancestor's pattern.
 - **Module line is unchanged** (`module github.com/go-git/go-git/v5`). The app consumes the fork with a
   `replace` directive, so import paths stay `github.com/go-git/go-git/v5`.
 - **Tags**: `vX.Y.Z-ssq.N` (never branch pseudo-versions). `v5.19.2-ssq.0` is the unmodified upstream

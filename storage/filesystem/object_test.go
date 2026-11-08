@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/go-git/go-billy/v5"
@@ -637,4 +638,131 @@ func (s *FsSuite) TestGetFromUnpackedDoesNotCacheLargeObjects(c *C) {
 	// The object should not have been cached during the load
 	_, ok = objectCache.Get(hash)
 	c.Assert(ok, Equals, false)
+}
+
+func (s *FsSuite) TestPackHandlePoolReusesAndBoundsHandles(c *C) {
+	hash := plumbing.NewHash("6ecf0ef2c2dffb796033e5a02219af86ec6584e5")
+	for _, tc := range []struct {
+		name    string
+		options Options
+		reuse   bool
+	}{
+		{"default pool", defaultPoolOptions(), true},
+		{"explicit bound", Options{MaxIdlePackHandles: 2}, true},
+		{"pool disabled", Options{MaxIdlePackHandles: -1}, false},
+	} {
+		var peak int64
+		tc.options.OnOpenPackHandles = func(open int64) {
+			if open > peak {
+				peak = open
+			}
+		}
+		fs := fixtures.Basic().ByTag(".git").One().DotGit()
+		o := NewObjectStorageWithOptions(dotgit.New(fs), cache.NewObjectLRUDefault(), tc.options)
+		for i := 0; i < 50; i++ {
+			obj, err := o.EncodedObject(plumbing.AnyObject, hash)
+			c.Assert(err, IsNil, Commentf(tc.name))
+			c.Assert(obj.Hash(), Equals, hash, Commentf(tc.name))
+		}
+		if tc.reuse {
+			c.Assert(peak, Equals, int64(1), Commentf("%s: 50 sequential reads must share one open handle", tc.name))
+			c.Assert(o.OpenPackHandles(), Equals, int64(1), Commentf(tc.name))
+		} else {
+			c.Assert(o.OpenPackHandles(), Equals, int64(0), Commentf(tc.name))
+		}
+		c.Assert(o.Close(), IsNil, Commentf(tc.name))
+		c.Assert(o.OpenPackHandles(), Equals, int64(0), Commentf("%s: Close must release idle handles", tc.name))
+	}
+}
+
+type fakeHandle struct{ closed *int }
+
+func (f fakeHandle) Close() error { *f.closed++; return nil }
+
+func (s *FsSuite) TestPackHandlePoolEvictsLeastRecentlyUsedPack(c *C) {
+	closed := 0
+	p := newPackHandlePool[fakeHandle](2, nil)
+	a, b, d := plumbing.Hash{1}, plumbing.Hash{2}, plumbing.Hash{3}
+	for _, h := range []plumbing.Hash{a, b} {
+		p.opened()
+		c.Assert(p.put(h, 0, fakeHandle{&closed}), IsNil)
+	}
+	c.Assert(closed, Equals, 0)
+
+	// A third pack evicts the least recently returned one (a), not itself.
+	p.opened()
+	c.Assert(p.put(d, 0, fakeHandle{&closed}), IsNil)
+	c.Assert(closed, Equals, 1)
+	_, hasA := p.get(a)
+	_, hasB := p.get(b)
+	_, hasD := p.get(d)
+	c.Assert([]bool{hasA, hasB, hasD}, DeepEquals, []bool{false, true, true})
+	c.Assert(p.open.Load(), Equals, int64(2))
+
+	// Same pack returned twice over the bound: only itself can be closed.
+	p = newPackHandlePool[fakeHandle](1, nil)
+	closed = 0
+	p.opened()
+	p.opened()
+	c.Assert(p.put(a, 0, fakeHandle{&closed}), IsNil)
+	c.Assert(p.put(a, 0, fakeHandle{&closed}), IsNil)
+	c.Assert(closed, Equals, 1)
+	c.Assert(p.closeAll(), IsNil)
+	c.Assert(closed, Equals, 2)
+	c.Assert(p.open.Load(), Equals, int64(0))
+
+	// A handle borrowed before closeAll is closed on return, not re-pooled.
+	p = newPackHandlePool[fakeHandle](4, nil)
+	closed = 0
+	p.opened()
+	gen := p.generation()
+	c.Assert(p.closeAll(), IsNil)
+	c.Assert(p.put(a, gen, fakeHandle{&closed}), IsNil)
+	c.Assert(closed, Equals, 1)
+	c.Assert(p.open.Load(), Equals, int64(0))
+	_, ok := p.get(a)
+	c.Assert(ok, Equals, false)
+}
+
+func (s *FsSuite) TestPackHandlePoolConcurrentReadsStayBounded(c *C) {
+	hash := plumbing.NewHash("6ecf0ef2c2dffb796033e5a02219af86ec6584e5")
+	fs := fixtures.Basic().ByTag(".git").One().DotGit()
+	o := NewObjectStorageWithOptions(dotgit.New(fs), cache.NewObjectLRUDefault(), Options{MaxIdlePackHandles: 2})
+	// Index loading is lazy and not goroutine-safe; read once first, as concurrent users of a
+	// storage do in practice.
+	_, err := o.EncodedObject(plumbing.AnyObject, hash)
+	c.Assert(err, IsNil)
+
+	const workers = 16
+	errs := make(chan error, workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			for i := 0; i < 20; i++ {
+				obj, err := o.EncodedObject(plumbing.AnyObject, hash)
+				if err == nil && obj.Hash() != hash {
+					err = fmt.Errorf("wrong object %s", obj.Hash())
+				}
+				if err != nil {
+					errs <- err
+					return
+				}
+			}
+			errs <- nil
+		}()
+	}
+	for w := 0; w < workers; w++ {
+		c.Assert(<-errs, IsNil)
+	}
+	c.Assert(o.OpenPackHandles() <= 2, Equals, true, Commentf("idle handles exceeded the bound: %d", o.OpenPackHandles()))
+	c.Assert(o.Close(), IsNil)
+	c.Assert(o.OpenPackHandles(), Equals, int64(0))
+}
+
+// defaultPoolOptions is the zero Options where the pool is on by default, and an explicit opt-in
+// on Windows, where it is off by default because open handles block deleting packs.
+func defaultPoolOptions() Options {
+	if runtime.GOOS == "windows" {
+		return Options{MaxIdlePackHandles: defaultMaxIdlePackHandles}
+	}
+	return Options{}
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 
@@ -34,6 +35,9 @@ type ObjectStorage struct {
 	packList    []plumbing.Hash
 	packListIdx int
 	packfiles   map[plumbing.Hash]*packfile.Packfile
+
+	// pool holds idle open pack handles for the default (no KeepDescriptors) mode; nil when disabled.
+	pool *packHandlePool[*packfile.Packfile]
 }
 
 // NewObjectStorage creates a new ObjectStorage with the given .git directory and cache.
@@ -43,11 +47,65 @@ func NewObjectStorage(dir *dotgit.DotGit, objectCache cache.Object) *ObjectStora
 
 // NewObjectStorageWithOptions creates a new ObjectStorage with the given .git directory, cache and extra options
 func NewObjectStorageWithOptions(dir *dotgit.DotGit, objectCache cache.Object, ops Options) *ObjectStorage {
-	return &ObjectStorage{
+	s := &ObjectStorage{
 		options:     ops,
 		objectCache: objectCache,
 		dir:         dir,
 	}
+	// On Windows an open handle blocks deleting the pack (repack, prune), so the pool is opt-in there.
+	poolByDefault := runtime.GOOS != "windows" || ops.MaxIdlePackHandles > 0
+	if !ops.KeepDescriptors && ops.MaxOpenDescriptors == 0 && ops.MaxIdlePackHandles >= 0 && poolByDefault {
+		idle := ops.MaxIdlePackHandles
+		if idle == 0 {
+			idle = defaultMaxIdlePackHandles
+		}
+		s.pool = newPackHandlePool[*packfile.Packfile](idle, ops.OnOpenPackHandles)
+	}
+	return s
+}
+
+// OpenPackHandles reports how many packfile handles are currently open on behalf of the
+// default idle-handle pool (idle plus in use). It is 0 when KeepDescriptors or
+// MaxOpenDescriptors manage handles instead.
+func (s *ObjectStorage) OpenPackHandles() int64 {
+	if s.pool == nil {
+		return 0
+	}
+	return s.pool.open.Load()
+}
+
+// acquirePackfile returns an open packfile and a release function. With the idle-handle pool the
+// handle is borrowed exclusively and returned to the pool; otherwise it behaves like the previous
+// open-per-read (or KeepDescriptors) logic.
+func (s *ObjectStorage) acquirePackfile(idx idxfile.Index, pack plumbing.Hash) (*packfile.Packfile, func() error, error) {
+	if s.pool == nil {
+		p, err := s.packfile(idx, pack)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !s.options.KeepDescriptors && s.options.MaxOpenDescriptors == 0 {
+			return p, p.Close, nil
+		}
+		return p, func() error { return nil }, nil
+	}
+
+	gen := s.pool.generation()
+	if p, ok := s.pool.get(pack); ok {
+		return p, func() error { return s.pool.put(pack, gen, p) }, nil
+	}
+
+	f, err := s.dir.ObjectPack(pack)
+	if err != nil {
+		return nil, nil, err
+	}
+	var p *packfile.Packfile
+	if s.objectCache != nil {
+		p = packfile.NewPackfileWithCache(idx, s.dir.Fs(), f, s.objectCache, s.options.LargeObjectThreshold)
+	} else {
+		p = packfile.NewPackfile(idx, s.dir.Fs(), f, s.options.LargeObjectThreshold)
+	}
+	s.pool.opened()
+	return p, func() error { return s.pool.put(pack, gen, p) }, nil
 }
 
 func (s *ObjectStorage) requireIndex() error {
@@ -73,6 +131,9 @@ func (s *ObjectStorage) requireIndex() error {
 // Reindex indexes again all packfiles. Useful if git changed packfiles externally
 func (s *ObjectStorage) Reindex() {
 	s.index = nil
+	if s.pool != nil {
+		_ = s.pool.closeAll()
+	}
 }
 
 func (s *ObjectStorage) loadIdxFile(h plumbing.Hash) (err error) {
@@ -304,14 +365,15 @@ func (s *ObjectStorage) encodedObjectSizeFromPackfile(h plumbing.Hash) (
 		return 0, err
 	}
 
-	p, err := s.packfile(idx, pack)
+	p, release, err := s.acquirePackfile(idx, pack)
 	if err != nil {
 		return 0, err
 	}
-
-	if !s.options.KeepDescriptors && s.options.MaxOpenDescriptors == 0 {
-		defer ioutil.CheckClose(p, &err)
-	}
+	defer func() {
+		if cerr := release(); err == nil {
+			err = cerr
+		}
+	}()
 
 	return p.GetSizeByOffset(offset)
 }
@@ -484,14 +546,15 @@ func (s *ObjectStorage) getFromPackfile(h plumbing.Hash, canBeDelta bool) (
 	}
 
 	idx := s.index[pack]
-	p, err := s.packfile(idx, pack)
+	p, release, err := s.acquirePackfile(idx, pack)
 	if err != nil {
 		return nil, err
 	}
-
-	if !s.options.KeepDescriptors && s.options.MaxOpenDescriptors == 0 {
-		defer ioutil.CheckClose(p, &err)
-	}
+	defer func() {
+		if cerr := release(); err == nil {
+			err = cerr
+		}
+	}()
 
 	if canBeDelta {
 		return s.decodeDeltaObjectAt(p, offset, hash)
@@ -674,6 +737,11 @@ func (s *ObjectStorage) Close() error {
 	}
 
 	s.packfiles = nil
+	if s.pool != nil {
+		if err := s.pool.closeAll(); firstError == nil && err != nil {
+			firstError = err
+		}
+	}
 	s.dir.Close()
 
 	return firstError
@@ -907,5 +975,9 @@ func (s *ObjectStorage) ObjectPacks() ([]plumbing.Hash, error) {
 }
 
 func (s *ObjectStorage) DeleteOldObjectPackAndIndex(h plumbing.Hash, t time.Time) error {
+	if s.pool != nil {
+		// An idle handle would block deleting the pack on Windows and pin its space elsewhere.
+		_ = s.pool.closeAll()
+	}
 	return s.dir.DeleteOldObjectPackAndIndex(h, t)
 }

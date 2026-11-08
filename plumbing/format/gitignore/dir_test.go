@@ -352,3 +352,26 @@ func (s *MatcherSuite) TestDir_LoadSystemPatterns(c *C) {
 	c.Assert(m.Match([]string{"go-git.v4.iml"}, true), Equals, true)
 	c.Assert(m.Match([]string{".idea"}, true), Equals, true)
 }
+
+// A directory ignored by an ancestor's pattern must not be descended into: git never reads
+// .gitignore files inside it, and walking it is the dominant cost of ReadPatterns on a repository
+// with large ignored trees.
+func (s *MatcherSuite) TestReadPatternsSkipsDirectoriesIgnoredByAncestors(c *C) {
+	fs := memfs.New()
+	write := func(path, content string) {
+		f, err := fs.Create(path)
+		c.Assert(err, IsNil)
+		_, err = f.Write([]byte(content))
+		c.Assert(err, IsNil)
+		c.Assert(f.Close(), IsNil)
+	}
+	write(".gitignore", "dist/\n")
+	write("a/b/.gitignore", "local\n")
+	write("a/b/dist/.gitignore", "inside-ignored\n")
+
+	ps, err := ReadPatterns(fs, nil)
+	c.Assert(err, IsNil)
+
+	// "dist/" and "local"; the pattern inside the ignored a/b/dist is never read.
+	c.Assert(ps, HasLen, 2)
+}
