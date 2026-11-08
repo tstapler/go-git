@@ -61,147 +61,164 @@ type renameDetector struct {
 	onlyExact   bool
 }
 
-// detectExactRenames detects matches files that were deleted with files that
-// were added where the hash is the same on both. If there are multiple targets
-// the one with the most similar path will be chosen as the rename and the
-// rest as either deletions or additions.
+// detectExactRenames pairs deleted and added files with identical content and a
+// compatible file type, the way git's find_exact_renames/find_identical_files
+// (diffcore-rename.c) does. Destinations are visited in path order; for each,
+// the unused source with the same basename wins, otherwise the first unused
+// source in path order. It is never limited by RenameLimit.
 func (d *renameDetector) detectExactRenames() {
-	added := groupChangesByHash(d.added)
-	deletes := groupChangesByHash(d.deleted)
-	var uniqueAdds []*Change
-	var nonUniqueAdds [][]*Change
+	sortChangesByName(d.added)
+	sortChangesByName(d.deleted)
+
+	srcsByHash := groupChangesByHash(d.deleted)
+	used := make(map[*Change]struct{})
 	var addedLeft []*Change
 
-	for _, cs := range added {
-		if len(cs) == 1 {
-			uniqueAdds = append(uniqueAdds, cs[0])
-		} else {
-			nonUniqueAdds = append(nonUniqueAdds, cs)
-		}
-	}
-
-	for _, c := range uniqueAdds {
-		hash := changeHash(c)
-		deleted := deletes[hash]
-
-		if len(deleted) == 1 {
-			if sameMode(c, deleted[0]) {
-				d.modified = append(d.modified, &Change{From: deleted[0].From, To: c.To})
-				delete(deletes, hash)
-			} else {
-				addedLeft = append(addedLeft, c)
+	for _, add := range d.added {
+		var best *Change
+		bestScore := 0
+		for _, src := range srcsByHash[changeHash(add)] {
+			if _, ok := used[src]; ok || !sameMode(src, add) {
+				continue
 			}
-		} else if len(deleted) > 1 {
-			bestMatch := bestNameMatch(c, deleted)
-			if bestMatch != nil && sameMode(c, bestMatch) {
-				d.modified = append(d.modified, &Change{From: bestMatch.From, To: c.To})
-				delete(deletes, hash)
-
-				var newDeletes = make([]*Change, 0, len(deleted)-1)
-				for _, d := range deleted {
-					if d != bestMatch {
-						newDeletes = append(newDeletes, d)
-					}
-				}
-				deletes[hash] = newDeletes
-			}
-		} else {
-			addedLeft = append(addedLeft, c)
-		}
-	}
-
-	for _, added := range nonUniqueAdds {
-		hash := changeHash(added[0])
-		deleted := deletes[hash]
-
-		if len(deleted) == 1 {
-			deleted := deleted[0]
-			bestMatch := bestNameMatch(deleted, added)
-			if bestMatch != nil && sameMode(deleted, bestMatch) {
-				d.modified = append(d.modified, &Change{From: deleted.From, To: bestMatch.To})
-				delete(deletes, hash)
-
-				for _, c := range added {
-					if c != bestMatch {
-						addedLeft = append(addedLeft, c)
-					}
-				}
-			} else {
-				addedLeft = append(addedLeft, added...)
-			}
-		} else if len(deleted) > 1 {
-			// No rename limit here: git's exact pass is unbounded, the limit only
-			// gates the inexact (content similarity) matrix.
-			maxSize := len(deleted) * len(added)
-
-			matrix := make(similarityMatrix, 0, maxSize)
-
-			for delIdx, del := range deleted {
-				deletedName := changeName(del)
-
-				for addIdx, add := range added {
-					addedName := changeName(add)
-
-					if !sameMode(del, add) {
-						continue
-					}
-
-					score := nameSimilarityScore(addedName, deletedName)
-					matrix = append(matrix, similarityPair{added: addIdx, deleted: delIdx, score: score})
-
-					if len(matrix) >= maxSize {
-						break
-					}
-				}
-
-				if len(matrix) >= maxSize {
+			// git: score = !rename_used (always 1 here) + basename_same.
+			score := 1 + basenameSame(src, add)
+			if score > bestScore {
+				best, bestScore = src, score
+				if score == 2 {
 					break
 				}
 			}
+		}
+		if best == nil {
+			addedLeft = append(addedLeft, add)
+			continue
+		}
+		used[best] = struct{}{}
+		d.modified = append(d.modified, &Change{From: best.From, To: add.To})
+	}
 
-			sort.Stable(matrix)
-
-			usedAdds := make(map[*Change]struct{})
-			usedDeletes := make(map[*Change]struct{})
-			for i := len(matrix) - 1; i >= 0; i-- {
-				del := deleted[matrix[i].deleted]
-				add := added[matrix[i].added]
-
-				if add == nil || del == nil {
-					// it was already matched
-					continue
-				}
-
-				usedAdds[add] = struct{}{}
-				usedDeletes[del] = struct{}{}
-				d.modified = append(d.modified, &Change{From: del.From, To: add.To})
-				added[matrix[i].added] = nil
-				deleted[matrix[i].deleted] = nil
-			}
-
-			for _, c := range added {
-				if _, ok := usedAdds[c]; !ok && c != nil {
-					addedLeft = append(addedLeft, c)
-				}
-			}
-
-			var newDeletes = make([]*Change, 0, len(deleted)-len(usedDeletes))
-			for _, c := range deleted {
-				if _, ok := usedDeletes[c]; !ok && c != nil {
-					newDeletes = append(newDeletes, c)
-				}
-			}
-			deletes[hash] = newDeletes
-		} else {
-			addedLeft = append(addedLeft, added...)
+	var deletedLeft []*Change
+	for _, del := range d.deleted {
+		if _, ok := used[del]; !ok {
+			deletedLeft = append(deletedLeft, del)
 		}
 	}
+	d.added, d.deleted = addedLeft, deletedLeft
+}
 
-	d.added = addedLeft
-	d.deleted = nil
-	for _, dels := range deletes {
-		d.deleted = append(d.deleted, dels...)
+func sortChangesByName(changes []*Change) {
+	sort.SliceStable(changes, func(i, j int) bool { return changeName(changes[i]) < changeName(changes[j]) })
+}
+
+func baseName(path string) string {
+	return path[strings.LastIndexByte(path, '/')+1:]
+}
+
+// basenameSame is git's basename_same: 1 when both paths end in the same file name.
+func basenameSame(src, dst *Change) int {
+	if baseName(changeName(src)) == baseName(changeName(dst)) {
+		return 1
 	}
+	return 0
+}
+
+// detectBasenameRenames mirrors git's find_basename_matches (diffcore-rename.c): before
+// the exhaustive matrix (and before the rename limit applies), a deleted and an added
+// file whose basename is unique among the remaining deleted and among the remaining
+// added files are paired when their content similarity reaches the minimum score.
+func (d *renameDetector) detectBasenameRenames() error {
+	srcBase := uniqueBasenames(d.deleted)
+	dstBase := uniqueBasenames(d.added)
+
+	usedSrc := make(map[int]struct{})
+	usedDst := make(map[int]struct{})
+	for dstIdx, add := range d.added {
+		base := baseName(changeName(add))
+		if dstBase[base] != dstIdx {
+			continue
+		}
+		srcIdx, ok := srcBase[base]
+		if !ok || srcIdx < 0 {
+			continue
+		}
+		score, ok, err := pairSimilarity(d.deleted[srcIdx], add, d.renameScore)
+		if err != nil {
+			return err
+		}
+		if !ok || score < d.renameScore*100 {
+			continue
+		}
+		usedSrc[srcIdx] = struct{}{}
+		usedDst[dstIdx] = struct{}{}
+		d.modified = append(d.modified, &Change{From: d.deleted[srcIdx].From, To: add.To})
+	}
+
+	var addedLeft, deletedLeft []*Change
+	for i, c := range d.added {
+		if _, ok := usedDst[i]; !ok {
+			addedLeft = append(addedLeft, c)
+		}
+	}
+	for i, c := range d.deleted {
+		if _, ok := usedSrc[i]; !ok {
+			deletedLeft = append(deletedLeft, c)
+		}
+	}
+	d.added, d.deleted = addedLeft, deletedLeft
+	return nil
+}
+
+// uniqueBasenames maps each basename to its index, or -1 when it occurs more than once.
+func uniqueBasenames(changes []*Change) map[string]int {
+	m := make(map[string]int, len(changes))
+	for i, c := range changes {
+		base := baseName(changeName(c))
+		if _, dup := m[base]; dup {
+			m[base] = -1
+		} else {
+			m[base] = i
+		}
+	}
+	return m
+}
+
+// pairSimilarity scores one source/destination pair on the 0..10000 scale. ok is false when
+// the pair cannot be a content rename (not two regular files, sizes too different, or a
+// file too large to index).
+func pairSimilarity(src, dst *Change, renameScore int) (score int, ok bool, err error) {
+	if !isRegularFile(changeMode(src)) || !isRegularFile(changeMode(dst)) {
+		return 0, false, nil
+	}
+	from, _, err := src.Files()
+	if err != nil {
+		return 0, false, err
+	}
+	_, to, err := dst.Files()
+	if err != nil {
+		return 0, false, err
+	}
+	srcSize, dstSize := from.Size+1, to.Size+1
+	lo, hi := srcSize, dstSize
+	if dstSize < srcSize {
+		lo, hi = dstSize, srcSize
+	}
+	if int(lo*100/hi) < renameScore {
+		return 0, false, nil
+	}
+	si, err := fileSimilarityIndex(from)
+	if err == errIndexFull {
+		return 0, false, nil
+	} else if err != nil {
+		return 0, false, err
+	}
+	di, err := fileSimilarityIndex(to)
+	if err == errIndexFull {
+		return 0, false, nil
+	} else if err != nil {
+		return 0, false, err
+	}
+	return si.score(di, 10000), true, nil
 }
 
 // detectContentRenames detects renames based on the similarity of the content
@@ -220,10 +237,16 @@ func (d *renameDetector) detectContentRenames() error {
 	}
 	renames := make([]*Change, 0, min(len(matrix), len(dsts)))
 
-	// Match rename pairs on a first come, first serve basis until
-	// we have looked at everything that is above the minimum score.
+	// Match rename pairs best first until everything above the minimum score has been
+	// looked at. Like git, only each destination's best numCandidatesPerDst sources are
+	// candidates (NUM_CANDIDATE_PER_DST in diffcore-rename.c).
+	seen := make(map[int]int)
 	for i := len(matrix) - 1; i >= 0; i-- {
 		pair := matrix[i]
+		seen[pair.added]++
+		if seen[pair.added] > numCandidatesPerDst {
+			continue
+		}
 		src := srcs[pair.deleted]
 		dst := dsts[pair.added]
 
@@ -271,6 +294,9 @@ func (d *renameDetector) detect() (Changes, error) {
 		d.detectExactRenames()
 
 		if !d.onlyExact {
+			if err := d.detectBasenameRenames(); err != nil {
+				return nil, err
+			}
 			if err := d.detectContentRenames(); err != nil {
 				return nil, err
 			}
@@ -397,18 +423,27 @@ func groupChangesByHash(changes []*Change) map[plumbing.Hash][]*Change {
 	return result
 }
 
+// numCandidatesPerDst is git's NUM_CANDIDATE_PER_DST.
+const numCandidatesPerDst = 4
+
 type similarityMatrix []similarityPair
 
 func (m similarityMatrix) Len() int      { return len(m) }
 func (m similarityMatrix) Swap(i, j int) { m[i], m[j] = m[j], m[i] }
+
+// Less orders by score, then by basename match (git's name_score), then prefers lower
+// indices, so iterating from the end picks the first path in sorted order on a tie.
 func (m similarityMatrix) Less(i, j int) bool {
-	if m[i].score == m[j].score {
-		if m[i].added == m[j].added {
-			return m[i].deleted < m[j].deleted
-		}
-		return m[i].added < m[j].added
+	if m[i].score != m[j].score {
+		return m[i].score < m[j].score
 	}
-	return m[i].score < m[j].score
+	if m[i].name != m[j].name {
+		return m[i].name < m[j].name
+	}
+	if m[i].added != m[j].added {
+		return m[i].added > m[j].added
+	}
+	return m[i].deleted > m[j].deleted
 }
 
 type similarityPair struct {
@@ -418,6 +453,8 @@ type similarityPair struct {
 	deleted int
 	// similarity score
 	score int
+	// 1 when both files have the same basename (git's name_score)
+	name int
 }
 
 func max(a, b int) int {
@@ -577,17 +614,14 @@ outerLoop:
 				return nil, err
 			}
 
-			contentScore := s.score(di, 10000)
-			// The name score returns a value between 0 and 100, so we need to
-			// convert it to the same range as the content score.
-			nameScore := nameSimilarityScore(src.From.Name, dst.To.Name) * 100
-			score := (contentScore*99 + nameScore*1) / 10000
-
-			if score < renameScore {
+			// Content similarity only, 0..10000, as git does; basename equality is a
+			// separate tie-break (name), not blended into the score.
+			score := s.score(di, 10000)
+			if score < renameScore*100 {
 				continue
 			}
 
-			matrix = append(matrix, similarityPair{added: dstIdx, deleted: srcIdx, score: score})
+			matrix = append(matrix, similarityPair{added: dstIdx, deleted: srcIdx, score: score, name: basenameSame(src, dst)})
 		}
 	}
 
