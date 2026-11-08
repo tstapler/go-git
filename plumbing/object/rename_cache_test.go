@@ -117,9 +117,7 @@ func TestSimilarityIndexCache_ShouldCacheOnlyWithinBudget(t *testing.T) {
 // DetectRenames must pair the same files as `git diff -M --name-status` on fixtures whose
 // edits are small enough that jgit-style and git spanhash scoring agree.
 func TestDetectRenames_MatchesGitCLI(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git not installed")
-	}
+	requireGitOracle(t)
 	dir := t.TempDir()
 	git := func(args ...string) string {
 		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
