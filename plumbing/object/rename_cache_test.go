@@ -98,13 +98,14 @@ func detectWithBudget(t testing.TB, srcs, dsts []*Change, score, budget int) []s
 // Pairings must not depend on the index cache: with the full budget, a budget that holds only
 // a couple of source indexes (the over-budget fallback rebuilds the rest per use) and none.
 func TestDetectRenames_ShouldNotDependOnIndexCacheBudget(t *testing.T) {
-	// A small index is 256 entries x 8 bytes = 2048 bytes, so 5000 holds two of them.
+	// Compacted indexes of these small files are 8 bytes per distinct line (about 100-250 bytes),
+	// so 300 holds only one or two of them.
 	for seed := int64(0); seed < 200; seed++ {
 		rng := rand.New(rand.NewSource(seed))
 		srcs, dsts := randomSides(t, rng, 1+rng.Intn(25), 1+rng.Intn(25))
 		for _, score := range []int{30, 60} {
 			want := detectWithBudget(t, srcs, dsts, score, -1)
-			for _, budget := range []int{0, 5000} {
+			for _, budget := range []int{0, 300} {
 				if got := detectWithBudget(t, srcs, dsts, score, budget); !reflect.DeepEqual(want, got) {
 					t.Fatalf("budget %d seed %d score %d: pairs differ\n none: %v\n got:  %v", budget, seed, score, want, got)
 				}
@@ -119,15 +120,35 @@ func TestSimilarityIndexCache_ShouldCacheOnlyWithinBudget(t *testing.T) {
 	file := func(i int) func() (*File, error) {
 		return func() (*File, error) { _, f, err := dsts[i].Files(); return f, err }
 	}
-	for _, tc := range []struct{ budget, want int }{{0, 0}, {5000, 2}, {maxCachedIndexBytes, 10}} {
+	total := 0
+	for i := range dsts {
+		idx, err := file(i)()
+		if err != nil {
+			t.Fatal(err)
+		}
+		si, err := fileSimilarityIndex(idx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		total += len(si.hashes) * 8
+	}
+	for _, tc := range []struct {
+		name   string
+		budget int
+		check  func(cached int) bool
+	}{
+		{"zero caches nothing", 0, func(n int) bool { return n == 0 }},
+		{"half the total caches some but not all", total / 2, func(n int) bool { return n > 0 && n < len(dsts) }},
+		{"default caches all", maxCachedIndexBytes, func(n int) bool { return n == len(dsts) }},
+	} {
 		c := newSimilarityIndexCache(tc.budget)
 		for i := range dsts {
 			if _, err := c.get(i, file(i)); err != nil {
 				t.Fatal(err)
 			}
 		}
-		if len(c.indexes) != tc.want {
-			t.Errorf("budget %d cached %d indexes, want %d", tc.budget, len(c.indexes), tc.want)
+		if !tc.check(len(c.indexes)) {
+			t.Errorf("%s: budget %d cached %d of %d", tc.name, tc.budget, len(c.indexes), len(dsts))
 		}
 	}
 }
