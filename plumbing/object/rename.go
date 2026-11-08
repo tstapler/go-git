@@ -424,7 +424,47 @@ func min(a, b int) int {
 
 const maxMatrixSize = 10000
 
+// maxCachedIndexBytes bounds the memory held by cached destination similarity
+// indexes (each is at most 1MiB). Past it, an index is rebuilt per use, which
+// is the pre-cache behaviour, so results never depend on the budget.
+const maxCachedIndexBytes = 128 << 20
+
+// similarityIndexCache builds each destination's similarity index once and
+// reuses it for every source, like git's diffcore-rename.c, which computes a
+// filespec's spanhash once (diff_filespec_populate / estimate_similarity via
+// cnt_data) and reuses it across all pairs.
+type similarityIndexCache struct {
+	indexes map[int]*similarityIndex
+	bytes   int
+	budget  int
+}
+
+func newSimilarityIndexCache(budget int) *similarityIndexCache {
+	return &similarityIndexCache{indexes: make(map[int]*similarityIndex), budget: budget}
+}
+
+// get returns the index for dst number idx, building it from file() when absent.
+func (c *similarityIndexCache) get(idx int, file func() (*File, error)) (*similarityIndex, error) {
+	if di, ok := c.indexes[idx]; ok {
+		return di, nil
+	}
+	f, err := file()
+	if err != nil {
+		return nil, err
+	}
+	di, err := fileSimilarityIndex(f)
+	if err != nil {
+		return nil, err
+	}
+	if size := len(di.hashes) * 8; c.bytes+size <= c.budget {
+		c.indexes[idx] = di
+		c.bytes += size
+	}
+	return di, nil
+}
+
 func buildSimilarityMatrix(srcs, dsts []*Change, renameScore int) (similarityMatrix, error) {
+	dstIndexes := newSimilarityIndexCache(maxCachedIndexBytes)
 	// Allocate for the worst-case scenario where every pair has a score
 	// that we need to consider. We might not need that many.
 	matrixSize := len(srcs) * len(dsts)
@@ -504,14 +544,13 @@ outerLoop:
 				}
 			}
 
-			if to == nil {
-				_, to, err = dst.Files()
-				if err != nil {
-					return nil, err
+			di, err := dstIndexes.get(dstIdx, func() (*File, error) {
+				if to != nil {
+					return to, nil
 				}
-			}
-
-			di, err := fileSimilarityIndex(to)
+				_, f, err := dst.Files()
+				return f, err
+			})
 			if err != nil {
 				if err == errIndexFull {
 					dstTooLarge[dstIdx] = true
