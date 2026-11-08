@@ -66,45 +66,51 @@ func randomSides(tb testing.TB, rng *rand.Rand, nSrc, nDst int) (srcs, dsts []*C
 		srcs = append(srcs, tbChange(tb, tbFile(tb, fmt.Sprintf("old/d%d/f%d.txt", rng.Intn(3), i), body(), mode()), nil))
 	}
 	for i := 0; i < nDst; i++ {
-		srcs2 := body()
+		content := body()
 		if rng.Intn(10) == 0 {
-			srcs2 = ""
+			content = ""
 		}
-		dsts = append(dsts, tbChange(tb, nil, tbFile(tb, fmt.Sprintf("new/d%d/g%d.txt", rng.Intn(3), i), srcs2, mode())))
+		dsts = append(dsts, tbChange(tb, nil, tbFile(tb, fmt.Sprintf("new/d%d/g%d.txt", rng.Intn(3), i), content, mode())))
 	}
 	return srcs, dsts
 }
 
-// The cached matrix must equal the pre-cache one pair for pair, including score
-// ties and ordering, with and without a cache budget.
+// The cached matrix must equal the uncached reference pair for pair (scores, ties and
+// order) whether the cache holds every destination index, only some of them (the
+// over-budget fallback rebuilds the rest per pair), or none.
 func TestBuildSimilarityMatrix_DifferentialAgainstUncached(t *testing.T) {
-	for seed := int64(0); seed < 200; seed++ {
-		rng := rand.New(rand.NewSource(seed))
-		srcs, dsts := randomSides(t, rng, 1+rng.Intn(25), 1+rng.Intn(25))
-		for _, score := range []int{30, 60} {
-			want, wantErr := buildSimilarityMatrixUncached(srcs, dsts, score)
-			got, gotErr := buildSimilarityMatrix(srcs, dsts, score)
-			if (wantErr == nil) != (gotErr == nil) || !reflect.DeepEqual(want, got) {
-				t.Fatalf("seed %d score %d: cached matrix differs (errs %v / %v)", seed, score, wantErr, gotErr)
+	// A small index is 256 entries x 8 bytes = 2048 bytes, so 5000 holds two of them.
+	for _, budget := range []int{maxCachedIndexBytes, 5000, 0} {
+		for seed := int64(0); seed < 200; seed++ {
+			rng := rand.New(rand.NewSource(seed))
+			srcs, dsts := randomSides(t, rng, 1+rng.Intn(25), 1+rng.Intn(25))
+			for _, score := range []int{30, 60} {
+				want, wantErr := buildSimilarityMatrixUncached(srcs, dsts, score)
+				got, gotErr := buildSimilarityMatrixWithBudget(srcs, dsts, score, budget)
+				if (wantErr == nil) != (gotErr == nil) || !reflect.DeepEqual(want, got) {
+					t.Fatalf("budget %d seed %d score %d: matrix differs (errs %v / %v)", budget, seed, score, wantErr, gotErr)
+				}
 			}
 		}
 	}
 }
 
-func TestBuildSimilarityMatrix_ZeroBudgetFallsBackToUncachedResult(t *testing.T) {
+func TestSimilarityIndexCache_ShouldCacheOnlyWithinBudget(t *testing.T) {
 	rng := rand.New(rand.NewSource(7))
-	srcs, dsts := randomSides(t, rng, 20, 20)
-	want, _ := buildSimilarityMatrixUncached(srcs, dsts, 40)
-	c := newSimilarityIndexCache(0)
-	if _, err := c.get(0, func() (*File, error) { _, f, err := dsts[0].Files(); return f, err }); err != nil {
-		t.Fatal(err)
+	_, dsts := randomSides(t, rng, 1, 10)
+	file := func(i int) func() (*File, error) {
+		return func() (*File, error) { _, f, err := dsts[i].Files(); return f, err }
 	}
-	if len(c.indexes) != 0 {
-		t.Fatalf("zero budget must cache nothing, cached %d", len(c.indexes))
-	}
-	got, _ := buildSimilarityMatrix(srcs, dsts, 40)
-	if !reflect.DeepEqual(want, got) {
-		t.Fatal("matrix differs")
+	for _, tc := range []struct{ budget, want int }{{0, 0}, {5000, 2}, {maxCachedIndexBytes, 10}} {
+		c := newSimilarityIndexCache(tc.budget)
+		for i := range dsts {
+			if _, err := c.get(i, file(i)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if len(c.indexes) != tc.want {
+			t.Errorf("budget %d cached %d indexes, want %d", tc.budget, len(c.indexes), tc.want)
+		}
 	}
 }
 
@@ -231,7 +237,7 @@ func buildSimilarityMatrixUncached(srcs, dsts []*Change, renameScore int) (simil
 	// later find the best matches.
 outerLoop:
 	for srcIdx, src := range srcs {
-		if changeMode(src) != filemode.Regular {
+		if !isRegularFile(changeMode(src)) {
 			continue
 		}
 
@@ -244,7 +250,7 @@ outerLoop:
 		var s *similarityIndex
 		var err error
 		for dstIdx, dst := range dsts {
-			if changeMode(dst) != filemode.Regular {
+			if !isRegularFile(changeMode(dst)) {
 				continue
 			}
 

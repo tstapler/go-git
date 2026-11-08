@@ -12,6 +12,10 @@ This is a public fork of [go-git/go-git](https://github.com/go-git/go-git) used 
   - `buildSimilarityMatrix` builds each destination's similarity index once (bounded cache, 128 MiB, falls
     back to per-pair rebuild) instead of once per source/destination pair; output is identical (differential
     test against the old implementation). `v5.19.3-ssq.4`.
+  - rename-detection parity with git for the exact pass and file types (`v5.19.3-ssq.4`): the exact pass is
+    never limited (the limit only gates the inexact matrix); regular and executable files pair with each
+    other, inexact detection needs two regular/executable files, and symlinks pair only exactly with
+    symlinks (all verified against `git diff -M`, see `rename_git_parity_test.go`).
 - **Module line is unchanged** (`module github.com/go-git/go-git/v5`). The app consumes the fork with a
   `replace` directive, so import paths stay `github.com/go-git/go-git/v5`.
 - **Tags**: `vX.Y.Z-ssq.N` (never branch pseudo-versions). `v5.19.2-ssq.0` is the unmodified upstream
