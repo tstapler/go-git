@@ -15,7 +15,6 @@ import (
 	"os"
 	"runtime/pprof"
 	"strconv"
-	"syscall"
 	"time"
 
 	"github.com/go-git/go-billy/v5/osfs"
@@ -25,13 +24,6 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/storage/filesystem"
 )
-
-// cpuTime is the process's user plus system CPU time; unlike wall time it stays comparable on a loaded machine.
-func cpuTime() time.Duration {
-	var ru syscall.Rusage
-	_ = syscall.Getrusage(syscall.RUSAGE_SELF, &ru)
-	return time.Duration(ru.Utime.Nano() + ru.Stime.Nano())
-}
 
 func best(f func() int) (wall, cpu time.Duration, n int) {
 	for i := 0; i < 3; i++ {
