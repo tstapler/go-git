@@ -2,6 +2,7 @@ package object
 
 import (
 	"fmt"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -173,4 +174,81 @@ func TestDetectRenames_MixedRegularAndSymlinkDuplicateGroup_MatchesGitCLI(t *tes
 	if got := assertParity(t, before, after, 50, 1000); len(got) != 0 {
 		t.Fatalf("expected no renames across regular/symlink, got %v", got)
 	}
+}
+
+// randomRenameFixture builds families of files. An exact family has 1-3 identical deleted files and
+// 0-3 identical added files (duplicates, shared basenames, cross-directory moves). An edited family is
+// one deleted and one added file whose content differs by one line out of ten, so their similarity is
+// far from the threshold and inexact ties cannot occur.
+func randomRenameFixture(rng *rand.Rand) (before, after []parityFile) {
+	var paths []string
+	for _, dir := range []string{"a", "b", "c", "d"} {
+		for _, base := range []string{"x.go", "y.go", "z.go", "w.go"} {
+			paths = append(paths, dir+"/"+base)
+		}
+	}
+	rng.Shuffle(len(paths), func(i, j int) { paths[i], paths[j] = paths[j], paths[i] })
+	take := func() string { p := paths[0]; paths = paths[1:]; return p }
+	for fam := 0; fam < 1+rng.Intn(5) && len(paths) >= 6; fam++ {
+		content := lines(fam)
+		if rng.Intn(2) == 0 {
+			for n := 1 + rng.Intn(3); n > 0; n-- {
+				before = append(before, parityFile{take(), content, filemode.Regular})
+			}
+			for n := rng.Intn(4); n > 0; n-- {
+				after = append(after, parityFile{take(), content, filemode.Regular})
+			}
+		} else {
+			before = append(before, parityFile{take(), content, filemode.Regular})
+			after = append(after, parityFile{take(), content + "edit\n", filemode.Regular})
+		}
+	}
+	return before, after
+}
+
+// Pairings must equal git's for duplicate groups, shared basenames and cross-directory moves
+// (tie-break among identical files, basename preference, basename pre-pass before the limit).
+func TestDetectRenames_RandomFixtures_MatchGitCLI(t *testing.T) {
+	for seed := int64(0); seed < 60; seed++ {
+		rng := rand.New(rand.NewSource(seed))
+		before, after := randomRenameFixture(rng)
+		if len(before) == 0 || len(after) == 0 {
+			continue
+		}
+		limit := 1 + rng.Intn(6)
+		want := gitRenames(t, before, after, 50, limit)
+		got := goGitRenames(t, before, after, 50, limit)
+		if !reflect.DeepEqual(want, got) {
+			t.Fatalf("seed %d limit %d: renames differ from git\n before: %v\n after: %v\n git: %v\n got: %v", seed, limit, before, after, want, got)
+		}
+	}
+}
+
+// The three divergences found in review of the limit change, each pinned against git.
+func TestDetectRenames_GitDivergencesFromReview_MatchGitCLI(t *testing.T) {
+	t.Run("tie among identical duplicates picks the first sorted path", func(t *testing.T) {
+		before := []parityFile{{"a/one", "same\n", filemode.Regular}, {"b/two", "same\n", filemode.Regular}, {"c/three", "same\n", filemode.Regular}}
+		after := []parityFile{{"d/new1", "same\n", filemode.Regular}, {"d/new2", "same\n", filemode.Regular}}
+		assertParity(t, before, after, 50, 1000)
+	})
+	t.Run("same basename preferred over directory similarity", func(t *testing.T) {
+		before := []parityFile{{"a/x.txt", lines(1), filemode.Regular}, {"b/y.txt", lines(1), filemode.Regular}}
+		after := []parityFile{{"b/x.txt", lines(1) + "edit\n", filemode.Regular}, {"a/y.txt", lines(1) + "edit\n", filemode.Regular}}
+		got := assertParity(t, before, after, 50, 1000)
+		if len(got) != 2 || got[0] != "a/x.txt b/x.txt" {
+			t.Fatalf("got %v", got)
+		}
+	})
+	t.Run("basename pre-pass pairs a file the product rule would skip", func(t *testing.T) {
+		before := []parityFile{{"e/z.go", lines(1), filemode.Regular}, {"e/w", lines(2), filemode.Regular}}
+		after := []parityFile{
+			{"b/z.go", lines(1) + "edit\n", filemode.Regular},
+			{"a/w", "", filemode.Regular},
+			{"a/lnk", "tgt", filemode.Symlink},
+		}
+		got := assertParity(t, before, after, 50, 2)
+		if len(got) != 1 {
+			t.Fatalf("expected the basename pair, got %v", got)
+		}
+	})
 }

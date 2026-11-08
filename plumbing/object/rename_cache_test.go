@@ -316,17 +316,12 @@ outerLoop:
 				return nil, err
 			}
 
-			contentScore := s.score(di, 10000)
-			// The name score returns a value between 0 and 100, so we need to
-			// convert it to the same range as the content score.
-			nameScore := nameSimilarityScore(src.From.Name, dst.To.Name) * 100
-			score := (contentScore*99 + nameScore*1) / 10000
-
-			if score < renameScore {
+			score := s.score(di, 10000)
+			if score < renameScore*100 {
 				continue
 			}
 
-			matrix = append(matrix, similarityPair{added: dstIdx, deleted: srcIdx, score: score})
+			matrix = append(matrix, similarityPair{added: dstIdx, deleted: srcIdx, score: score, name: basenameSame(src, dst)})
 		}
 	}
 
