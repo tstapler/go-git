@@ -34,6 +34,14 @@ type Options struct {
 	// MaxOpenDescriptors is the max number of file descriptors to keep
 	// open. If KeepDescriptors is true, all file descriptors will remain open.
 	MaxOpenDescriptors int
+	// MaxIdlePackHandles bounds the open packfile handles kept idle between object reads when
+	// neither KeepDescriptors nor MaxOpenDescriptors is set. 0 selects a default of 32; a negative
+	// value disables the pool and reopens the pack for every read. Handles are closed by Close
+	// (or by the garbage collector if the storage is dropped without Close).
+	MaxIdlePackHandles int
+	// OnOpenPackHandles, when set, is called with the number of open pooled pack handles each time
+	// it changes, for metrics. It must be fast and must not call back into the storage.
+	OnOpenPackHandles func(open int64)
 	// LargeObjectThreshold maximum object size (in bytes) that will be read in to memory.
 	// If left unset or set to 0 there is no limit
 	LargeObjectThreshold int64
