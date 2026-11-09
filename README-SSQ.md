@@ -93,3 +93,10 @@ tag `vX.Y.Z-ssq.N`, then bump the `replace` line in stapler-squad.
 
 In stapler-squad, delete the `replace github.com/go-git/go-git/v5 => ...` line from `go.mod`, run
 `go mod tidy`, and rebuild. See `docs/how-to/roll-back-go-git-fork.md` in stapler-squad.
+
+## Fork patches (beyond the files above)
+
+- `plumbing/format/index/decoder.go`: entry decode reads the 62-byte header in one `io.ReadFull`
+  and allocates entries and names in bulk instead of `encoding/binary.Read` per field
+  (15.2 -> 2.2 allocs/entry on a mixed 10k-entry index). Behaviour is unchanged; `decoder_perf_test.go`
+  compares against the legacy decoder.
